@@ -13,22 +13,23 @@ const MAX_PLAYERS = 6;
 const ROOM_IDLE_CLEANUP_MS = 1000 * 60 * 60 * 3; // vide une room après 3h sans joueurs
 const HILL_TICK_MS = 2000;
 const HILL_CELLS = [[5, 5], [5, 6], [6, 5], [6, 6]]; // "colline" au centre de la grille
+const DEFAULT_TELEGRAPH_MS = 1300; // temps entre le clignotement et l'impact réel
 
 const COLORS = ["#ef4444", "#3b82f6", "#22c55e", "#eab308", "#a855f7", "#f97316"];
 
 const ATTACKS = [
-  { id: "meteor",    name: "Météorite",       desc: "Frappe une zone 3x3 choisie",              target: "zone", size: 3, damage: 25 },
-  { id: "airstrike", name: "Frappe aérienne", desc: "3 impacts aléatoires dans une zone 5x5",    target: "zone", size: 5, damage: 15, hits: 3, random: true },
-  { id: "snipe",     name: "Tir de précision",desc: "Grosse dégâts sur une case, longue portée", target: "cell", damage: 35 },
-  { id: "shockwave", name: "Onde de choc",    desc: "Frappe toutes les cases autour de toi",     target: "self", damage: 18 },
-  { id: "gunline",   name: "Rafale",          desc: "Mitraille toute une ligne ou colonne",      target: "line", damage: 12 },
-  { id: "grenade",   name: "Grenade",         desc: "Explosion sur une zone 2x2",                target: "zone", size: 2, damage: 20 },
+  { id: "meteor",    name: "Météorite",       desc: "Frappe une zone 3x3 choisie",              target: "zone", size: 3, damage: 25, telegraphMs: 1300 },
+  { id: "airstrike", name: "Frappe aérienne", desc: "3 impacts aléatoires dans une zone 5x5",    target: "zone", size: 5, damage: 15, hits: 3, random: true, telegraphMs: 1500 },
+  { id: "snipe",     name: "Tir de précision",desc: "Grosse dégâts sur une case, longue portée", target: "cell", damage: 35, telegraphMs: 900 },
+  { id: "shockwave", name: "Onde de choc",    desc: "Frappe toutes les cases autour de toi",     target: "self", damage: 18, telegraphMs: 1100 },
+  { id: "gunline",   name: "Rafale",          desc: "Mitraille toute une ligne ou colonne",      target: "line", damage: 12, telegraphMs: 1300 },
+  { id: "grenade",   name: "Grenade",         desc: "Explosion sur une zone 2x2",                target: "zone", size: 2, damage: 20, telegraphMs: 1100 },
   { id: "mine",      name: "Piège explosif",  desc: "Pose une mine invisible sur une case",      target: "cell", damage: 30, trap: true },
   { id: "heal",      name: "Soin d'urgence",  desc: "Soigne toi ou un allié proche",             target: "ally", heal: 25 },
   { id: "shield",    name: "Bouclier",        desc: "Absorbe la prochaine attaque reçue",        target: "self", shield: true },
-  { id: "poison",    name: "Zone toxique",    desc: "Nuage toxique 3x3, dégâts sur 3 tours",     target: "zone", size: 3, damage: 8, poison: true, ticks: 3 },
+  { id: "poison",    name: "Zone toxique",    desc: "Nuage toxique 3x3, dégâts sur 3 tours",     target: "zone", size: 3, damage: 8, poison: true, ticks: 3, telegraphMs: 1300 },
   { id: "teleport",  name: "Téléportation",   desc: "Téléporte-toi dans un rayon de 4 cases",    target: "cell", teleport: true, range: 4 },
-  { id: "charge",    name: "Charge",          desc: "Fonce en ligne droite sur 2 cases",         target: "direction", damage: 22, distance: 2 },
+  { id: "charge",    name: "Charge",          desc: "Fonce en ligne droite sur 2 cases",         target: "direction", damage: 22, distance: 2, telegraphMs: 1000 },
 ];
 
 // ---- Modes de jeu ----
@@ -65,6 +66,7 @@ class Room {
     this.hillTimer = null; // setInterval du mode Roi de la case
     this.lastActivity = Date.now();
     this.lastAttackId = null;
+    this.pendingAttacks = new Set(); // timeouts des attaques en cours de télégraphe
 
     this.mode = null;
     this.config = {};
@@ -161,6 +163,8 @@ class Room {
     this.cardPickups = [];
     this.lastAttackId = null;
     this.turn = null;
+    this.pendingAttacks.forEach(h => clearTimeout(h));
+    this.pendingAttacks.clear();
 
     for (const p of Object.values(this.players)) {
       const spawn = this.freeSpawn();
@@ -198,6 +202,8 @@ class Room {
     this.winner = { ids: winnerIds, reason };
     if (this.timer) clearTimeout(this.timer);
     if (this.hillTimer) clearInterval(this.hillTimer);
+    this.pendingAttacks.forEach(h => clearTimeout(h));
+    this.pendingAttacks.clear();
     this.turn = null;
     const names = winnerIds.map(id => this.players[id]?.pseudo).filter(Boolean);
     this.pushLog(names.length ? `Victoire de ${names.join(" et ")} !` : "Match nul — personne ne l'emporte.");
@@ -309,69 +315,120 @@ class Room {
     if (!turn || turn.playerId !== player.id) return;
     if (Date.now() > turn.deadline) return;
     const attack = turn.attack;
-    let affected = [];
-    const hitPlayerAt = (x, y) => Object.values(this.players).find(p => p.alive && p.x === x && p.y === y);
+    this.turn = null;
 
-    if (attack.target === "zone" && !attack.poison) {
+    // Attaques qui font des dégâts (hors piège) : clignotement puis impact différé,
+    // pour laisser le temps aux autres joueurs de s'écarter.
+    const isDelayed = !!attack.damage && !attack.trap;
+
+    if (!isDelayed) {
+      const affected = this.resolveAttackEffects(player, attack, msg, null);
+      this.pushLog(`${player.pseudo} utilise ${attack.name} !`);
+      this.broadcast({ type: "attackResolved", attackId: attack.id, by: player.id, cells: affected });
+    } else {
+      const cells = this.computeAttackCells(player, attack, msg);
+      const delay = attack.telegraphMs || DEFAULT_TELEGRAPH_MS;
+      const resolveAt = Date.now() + delay;
+      this.pushLog(`${player.pseudo} prépare ${attack.name} !`);
+      this.broadcast({ type: "telegraph", attackId: attack.id, by: player.id, cells, resolveAt });
+
+      const handle = setTimeout(() => {
+        this.pendingAttacks.delete(handle);
+        if (this.status !== "playing") return;
+        const liveAttacker = this.players[player.id];
+        if (!liveAttacker) return;
+        const affected = this.resolveAttackEffects(liveAttacker, attack, msg, cells);
+        this.broadcast({ type: "attackResolved", attackId: attack.id, by: liveAttacker.id, cells: affected });
+        this.broadcast(this.publicState());
+      }, delay);
+      if (handle.unref) handle.unref();
+      this.pendingAttacks.add(handle);
+    }
+
+    this.broadcast(this.publicState());
+    if (this.status === "playing") this.scheduleTick(TURN_GAP_MS);
+  }
+
+  // Calcule, au moment de la déclaration, les cases qui seront touchées
+  // (c'est exactement ce qui clignote côté client — donc ce qui est évitable).
+  computeAttackCells(player, attack, msg) {
+    if (attack.target === "zone" && attack.random) {
       const zone = this.cellsForZone(msg.x, msg.y, attack.size);
-      if (attack.random) {
-        for (let i = 0; i < (attack.hits || 1); i++) {
-          const c = zone[randInt(zone.length)];
-          affected.push(c);
-          const hitP = hitPlayerAt(c.x, c.y);
-          if (hitP) this.applyDamage(player.id, hitP, attack.damage);
-        }
-      } else {
-        affected = zone;
-        for (const c of zone) { const hitP = hitPlayerAt(c.x, c.y); if (hitP) this.applyDamage(player.id, hitP, attack.damage); }
-      }
-    } else if (attack.target === "zone" && attack.poison) {
-      const zone = this.cellsForZone(msg.x, msg.y, attack.size);
-      affected = zone;
-      for (const c of zone) { const hitP = hitPlayerAt(c.x, c.y); if (hitP) this.applyDamage(player.id, hitP, attack.damage); }
-      this.hazards.push({ type: "poison", x: msg.x, y: msg.y, size: attack.size, damage: Math.round(attack.damage / 2), ticks: attack.ticks, ownerId: player.id });
-    } else if (attack.target === "cell" && attack.trap) {
-      if (inBounds(msg.x, msg.y)) { this.hazards.push({ type: "mine", x: msg.x, y: msg.y, damage: attack.damage, ownerId: player.id }); affected = [{ x: msg.x, y: msg.y }]; }
-    } else if (attack.target === "cell" && attack.teleport) {
-      const dist = Math.abs(msg.x - player.x) + Math.abs(msg.y - player.y);
-      if (inBounds(msg.x, msg.y) && dist <= attack.range && !hitPlayerAt(msg.x, msg.y)) { player.x = msg.x; player.y = msg.y; }
-    } else if (attack.target === "cell") {
-      if (inBounds(msg.x, msg.y)) { affected = [{ x: msg.x, y: msg.y }]; const hitP = hitPlayerAt(msg.x, msg.y); if (hitP) this.applyDamage(player.id, hitP, attack.damage); }
-    } else if (attack.target === "self" && attack.shield) {
-      player.shield = true;
-    } else if (attack.target === "self") {
+      const picks = [];
+      for (let i = 0; i < (attack.hits || 1); i++) picks.push(zone[randInt(zone.length)]);
+      return picks;
+    }
+    if (attack.target === "zone") {
+      return this.cellsForZone(msg.x, msg.y, attack.size);
+    }
+    if (attack.target === "cell") {
+      return inBounds(msg.x, msg.y) ? [{ x: msg.x, y: msg.y }] : [];
+    }
+    if (attack.target === "self") {
+      const cells = [];
       for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
         if (dx === 0 && dy === 0) continue;
         const x = player.x + dx, y = player.y + dy;
-        if (!inBounds(x, y)) continue;
-        affected.push({ x, y });
-        const hitP = hitPlayerAt(x, y);
-        if (hitP) this.applyDamage(player.id, hitP, attack.damage);
+        if (inBounds(x, y)) cells.push({ x, y });
       }
-    } else if (attack.target === "line") {
+      return cells;
+    }
+    if (attack.target === "line") {
       const axis = msg.axis === "col" ? "col" : "row";
-      affected = [];
+      const cells = [];
       for (let i = 0; i < GRID_SIZE; i++) {
         const x = axis === "row" ? i : msg.x;
         const y = axis === "row" ? msg.y : i;
-        affected.push({ x, y });
-        const hitP = hitPlayerAt(x, y);
-        if (hitP) this.applyDamage(player.id, hitP, attack.damage);
+        cells.push({ x, y });
       }
-    } else if (attack.target === "direction") {
+      return cells;
+    }
+    if (attack.target === "direction") {
       const dirs = { up: [0, -1], down: [0, 1], left: [-1, 0], right: [1, 0] };
       const d = dirs[msg.dir] || [0, 0];
       let cx = player.x, cy = player.y;
+      const cells = [];
       for (let step = 0; step < attack.distance; step++) {
         const nx = cx + d[0], ny = cy + d[1];
         if (!inBounds(nx, ny)) break;
         cx = nx; cy = ny;
-        affected.push({ x: cx, y: cy });
-        const hitP = hitPlayerAt(cx, cy);
-        if (hitP) this.applyDamage(player.id, hitP, attack.damage);
+        cells.push({ x: cx, y: cy });
       }
-      const occupied = Object.values(this.players).some(p => p.alive && p.id !== player.id && p.x === cx && p.y === cy);
-      if (!occupied) { player.x = cx; player.y = cy; }
+      return cells;
+    }
+    return [];
+  }
+
+  // Applique réellement les effets. Pour les attaques différées, `precomputedCells`
+  // est la liste figée au moment du télégraphe : les dégâts touchent qui s'y trouve
+  // AU MOMENT DE L'IMPACT (donc esquivable en bougeant entre-temps).
+  resolveAttackEffects(player, attack, msg, precomputedCells) {
+    const hitPlayerAt = (x, y) => Object.values(this.players).find(p => p.alive && p.x === x && p.y === y);
+
+    if (precomputedCells) {
+      const affected = precomputedCells;
+      for (const c of affected) { const hitP = hitPlayerAt(c.x, c.y); if (hitP) this.applyDamage(player.id, hitP, attack.damage); }
+
+      if (attack.poison) {
+        this.hazards.push({ type: "poison", x: msg.x, y: msg.y, size: attack.size, damage: Math.round(attack.damage / 2), ticks: attack.ticks, ownerId: player.id });
+      }
+      if (attack.target === "direction") {
+        const dest = affected[affected.length - 1] || { x: player.x, y: player.y };
+        const occupied = Object.values(this.players).some(p => p.alive && p.id !== player.id && p.x === dest.x && p.y === dest.y);
+        if (!occupied) { player.x = dest.x; player.y = dest.y; }
+      }
+      return affected;
+    }
+
+    // ---- Effets instantanés : piège, téléportation, soin, bouclier ----
+    let affected = [];
+    if (attack.target === "cell" && attack.trap) {
+      if (inBounds(msg.x, msg.y)) { this.hazards.push({ type: "mine", x: msg.x, y: msg.y, damage: attack.damage, ownerId: player.id }); affected = [{ x: msg.x, y: msg.y }]; }
+    } else if (attack.target === "cell" && attack.teleport) {
+      const dist = Math.abs(msg.x - player.x) + Math.abs(msg.y - player.y);
+      if (inBounds(msg.x, msg.y) && dist <= attack.range && !hitPlayerAt(msg.x, msg.y)) { player.x = msg.x; player.y = msg.y; }
+    } else if (attack.target === "self" && attack.shield) {
+      player.shield = true;
     } else if (attack.target === "ally") {
       const targetId = msg.targetId || player.id;
       const target = this.players[targetId];
@@ -380,12 +437,7 @@ class Room {
         if (target.id === player.id || dist <= 2) this.applyHeal(target, attack.heal);
       }
     }
-
-    this.pushLog(`${player.pseudo} utilise ${attack.name} !`);
-    this.turn = null;
-    this.broadcast({ type: "attackResolved", attackId: attack.id, by: player.id, cells: affected });
-    this.broadcast(this.publicState());
-    if (this.status === "playing") this.scheduleTick(TURN_GAP_MS);
+    return affected;
   }
 
   // ---- Roi de la case : points périodiques ----
@@ -481,6 +533,7 @@ const cleanupInterval = setInterval(() => {
     if (!hasPlayers && now - room.lastActivity > ROOM_IDLE_CLEANUP_MS) {
       if (room.timer) clearTimeout(room.timer);
       if (room.hillTimer) clearInterval(room.hillTimer);
+      room.pendingAttacks.forEach(h => clearTimeout(h));
       rooms.delete(code);
     }
   }
