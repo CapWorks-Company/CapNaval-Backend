@@ -4,7 +4,7 @@ const { WebSocketServer } = require("ws");
 const crypto = require("crypto");
 
 const GRID_SIZE = 12;
-const MOVE_COOLDOWN_MS = 350;
+const MOVE_COOLDOWN_MS = 800;
 const MUD_COOLDOWN_MULT = 2;
 const SPEED_COOLDOWN_MULT = 0.5;
 const RESIST_DAMAGE_MULT = 0.5;
@@ -23,7 +23,8 @@ const MAX_POWERUPS_ON_MAP = 3;
 const DEFAULT_POWERUP_INTERVAL_SEC = 14;
 const POWERUP_TYPES = ["heal", "resist", "speed"];
 const RECONNECT_GRACE_MS = 90000; // 90s pour se reconnecter avant d'être retiré pour de bon
-const SHRINK_INTERVAL_MS = 18000; // délai entre deux rétrécissements
+const SHRINK_PRESETS_SEC = { slow: 30, medium: 18, fast: 9 }; // vitesses prédéfinies
+const SHRINK_MODES = ["slow", "medium", "fast", "onKO", "custom"];
 const SHRINK_INITIAL_RADIUS = 6;  // couvre toute la grille 12x12 au départ
 const SHRINK_MIN_RADIUS = 1;
 const SHRINK_DAMAGE_PER_SEC = 6;
@@ -38,10 +39,10 @@ const ATTACKS = [
   { id: "snipe",        name: "Tir de précision",  desc: "Dégâts élevés sur une case, instantané",       target: "cell", damage: 35, instant: true },
   { id: "laser",        name: "Rayon laser",       desc: "Frappe une ligne entière, instantané",         target: "line", damage: 16, instant: true },
   { id: "shockwave",    name: "Onde de choc",      desc: "Frappe toutes les cases autour de toi",        target: "self", damage: 18, telegraphMs: 1100 },
-  { id: "gunline",      name: "Rafale",            desc: "Mitraille une ligne (stoppée par les murs)",   target: "line", damage: 12, telegraphMs: 1300 },
+  { id: "gunline",      name: "Rafale",            desc: "Mitraille une ligne, stoppée par les murs",   target: "line", damage: 12, telegraphMs: 1300 },
   { id: "grenade",      name: "Grenade",           desc: "Explosion sur une zone 2x2",                   target: "zone", size: 2, damage: 20, telegraphMs: 1100 },
   { id: "arrow",        name: "Flèche perforante", desc: "Transperce en ligne droite jusqu'à un mur",    target: "direction", damage: 16, distance: 12, moveSelf: false, telegraphMs: 1000 },
-  { id: "charge",       name: "Charge",            desc: "Fonce en ligne droite sur 2 cases",            target: "direction", damage: 22, distance: 2, moveSelf: true, telegraphMs: 1000 },
+  { id: "charge",       name: "Charge",            desc: "Fonce en ligne droite sur 2 cases, instantané",target: "direction", damage: 22, distance: 2, moveSelf: true, instant: true },
   { id: "tornado",      name: "Tornade",           desc: "Aspire les joueurs vers le centre d'une zone 3x3", target: "zone", size: 3, damage: 10, pull: true, telegraphMs: 1300 },
   { id: "net",          name: "Filet",             desc: "Immobilise le joueur touché 3 secondes",       target: "cell", damage: 5, root: true, rootMs: 3000, telegraphMs: 1000 },
   { id: "frost",        name: "Vague de givre",    desc: "Ralentit et blesse légèrement une zone 3x3",   target: "zone", size: 3, damage: 8, slow: true, slowMs: 6000, telegraphMs: 1200 },
@@ -53,17 +54,17 @@ const ATTACKS = [
 ];
 
 const MODES = {
-  survivor: { label: "Dernier survivant", desc: "Pas de respawn. Le dernier debout (ou la dernière équipe) gagne.", respawns: false },
-  koHunt:   { label: "Chasse au K.O.",    desc: "Premier à X éliminations gagne (cumul d'équipe si activé).", respawns: true },
+  survivor: { label: "Dernier survivant", desc: "Pas de respawn. Le dernier debout, ou la dernière équipe, gagne.", respawns: false },
+  koHunt:   { label: "Chasse au K.O.",    desc: "Premier à X éliminations gagne, cumul d'équipe si activé.", respawns: true },
   kingHill: { label: "Roi de la case",    desc: "Reste sur la case centrale pour marquer des points. Premier à X points gagne.", respawns: true },
-  chrono:   { label: "Chrono",            desc: "Partie limitée dans le temps. Le plus d'éliminations à la fin gagne (mort subite en cas d'égalité).", respawns: true },
+  chrono:   { label: "Chrono",            desc: "Partie limitée dans le temps. Le plus d'éliminations à la fin gagne, mort subite en cas d'égalité.", respawns: true },
 };
 
 const MAPS = {
   open:    { label: "Terrain ouvert", desc: "Aucun obstacle.",                                  walls: 0,  barrels: 0,  mud: 0 },
   ruins:   { label: "Ruines",         desc: "Des murs pour se mettre à couvert.",                walls: 14, barrels: 4,  mud: 0 },
   swamp:   { label: "Marécage",       desc: "Des flaques de boue ralentissent les déplacements.",walls: 6,  barrels: 2,  mud: 12 },
-  arsenal: { label: "Arsenal",        desc: "Beaucoup de tonneaux explosifs (réaction en chaîne).",walls: 8,  barrels: 14, mud: 0 },
+  arsenal: { label: "Arsenal",        desc: "Beaucoup de tonneaux explosifs, réaction en chaîne.",walls: 8,  barrels: 14, mud: 0 },
 };
 
 function randInt(n) { return Math.floor(Math.random() * n); }
@@ -90,7 +91,10 @@ class Room {
     this.powerupIntervalSec = DEFAULT_POWERUP_INTERVAL_SEC;
     this.lastPowerupSpawn = 0;
     this.teamsEnabled = false;
+    this.pushEnabled = true;
     this.shrinkEnabled = false;
+    this.shrinkMode = "medium";
+    this.shrinkIntervalSec = SHRINK_PRESETS_SEC.medium;
     this.shrinkRadius = SHRINK_INITIAL_RADIUS;
     this.lastShrinkAt = 0;
     this.isPublic = false;
@@ -130,6 +134,7 @@ class Room {
       mapId: this.mapId,
       mapLabel: MAPS[this.mapId] ? MAPS[this.mapId].label : null,
       teamsEnabled: this.teamsEnabled,
+      pushEnabled: this.pushEnabled,
       teamColors: TEAM_COLORS,
       turn: this.turn ? {
         playerId: this.turn.playerId,
@@ -147,7 +152,7 @@ class Room {
       hillCells: HILL_CELLS.map(([x, y]) => ({ x, y })),
       winner: this.winner,
       isPublic: this.isPublic,
-      shrink: { enabled: this.shrinkEnabled, radius: this.shrinkRadius, center: this.shrinkCenter() },
+      shrink: { enabled: this.shrinkEnabled, radius: this.shrinkRadius, center: this.shrinkCenter(), mode: this.shrinkMode, intervalSec: this.shrinkIntervalSec },
     };
   }
 
@@ -236,7 +241,7 @@ class Room {
     if (!p) return;
     if (this.status === "playing") {
       p.connected = false; p.ws = null; p.disconnectedAt = Date.now();
-      this.pushLog(`${p.pseudo} est déconnecté (reconnexion possible).`);
+      this.pushLog(`${p.pseudo} est déconnecté — reconnexion possible.`);
     } else {
       this.pushLog(`${p.pseudo} a quitté la partie.`);
       delete this.players[id];
@@ -259,7 +264,7 @@ class Room {
   purgeStaleDisconnected() {
     for (const [id, p] of Object.entries(this.players)) {
       if (!p.connected && p.disconnectedAt && Date.now() - p.disconnectedAt > RECONNECT_GRACE_MS) {
-        this.pushLog(`${p.pseudo} a été retiré (déconnecté trop longtemps).`);
+        this.pushLog(`${p.pseudo} a été retiré — déconnecté trop longtemps.`);
         delete this.players[id];
         if (this.hostId === id) this.hostId = Object.keys(this.players)[0] || null;
       }
@@ -310,7 +315,12 @@ class Room {
     this.powerupsEnabled = rawConfig.powerupsEnabled !== false && rawConfig.powerupsEnabled !== "false";
     this.powerupIntervalSec = clamp(parseInt(rawConfig.powerupIntervalSec) || DEFAULT_POWERUP_INTERVAL_SEC, 5, 120);
     this.teamsEnabled = rawConfig.teamsEnabled === true || rawConfig.teamsEnabled === "true";
+    this.pushEnabled = rawConfig.pushEnabled !== false && rawConfig.pushEnabled !== "false";
     this.shrinkEnabled = rawConfig.shrinkEnabled === true || rawConfig.shrinkEnabled === "true";
+    this.shrinkMode = SHRINK_MODES.includes(rawConfig.shrinkMode) ? rawConfig.shrinkMode : "medium";
+    this.shrinkIntervalSec = this.shrinkMode === "custom"
+      ? clamp(parseInt(rawConfig.shrinkIntervalSec) || 18, 3, 300)
+      : (SHRINK_PRESETS_SEC[this.shrinkMode] || SHRINK_PRESETS_SEC.medium);
     this.shrinkRadius = SHRINK_INITIAL_RADIUS;
     this.lastShrinkAt = Date.now();
     this.suddenDeath = false;
@@ -338,7 +348,7 @@ class Room {
     if (mode === "chrono") this.chronoEndAt = Date.now() + config.minutes * 60000;
     else this.chronoEndAt = null;
 
-    this.pushLog(`Partie lancée — mode ${MODES[mode].label} sur ${MAPS[this.mapId].label}${this.teamsEnabled ? " (par équipes)" : ""} !`);
+    this.pushLog(`Partie lancée — mode ${MODES[mode].label} sur ${MAPS[this.mapId].label}${this.teamsEnabled ? " — par équipes" : ""} !`);
     this.broadcast(this.publicState());
 
     if (this.hillTimer) clearInterval(this.hillTimer);
@@ -441,6 +451,12 @@ class Room {
     victim.timesKO += 1;
     this.pushLog(`${victim.pseudo} est K.O. !`);
 
+    if (this.shrinkEnabled && this.shrinkMode === "onKO" && this.shrinkRadius > SHRINK_MIN_RADIUS) {
+      this.shrinkRadius -= 1;
+      this.lastShrinkAt = Date.now();
+      this.pushLog("⚠️ La zone se rétrécit !");
+    }
+
     const attacker = attackerId ? this.players[attackerId] : null;
     if (attacker && attacker.id !== victim.id) attacker.eliminations += 1;
 
@@ -541,6 +557,7 @@ class Room {
 
     const occupant = Object.values(this.players).find(p => p.alive && p.id !== player.id && p.x === x && p.y === y);
     if (occupant) {
+      if (!this.pushEnabled) return; // poussée désactivée : la case est infranchissable, comme un mur
       const pushX = x + dx, pushY = y + dy;
       const pushBlocked = !inBounds(pushX, pushY) || this.isBlocked(pushX, pushY) ||
         Object.values(this.players).some(p => p.alive && p.id !== occupant.id && p.x === pushX && p.y === pushY);
@@ -717,6 +734,17 @@ class Room {
       for (const c of affected) { const hitP = hitPlayerAt(c.x, c.y); if (hitP) this.applyDamage(player.id, hitP, attack.damage); }
       const extra = this.triggerBarrelChain(player.id, affected);
       affected = affected.concat(extra);
+    } else if (attack.target === "direction" && attack.instant) {
+      const cells = this.computeAttackCells(player, attack, msg);
+      affected = cells.slice();
+      for (const c of affected) { const hitP = hitPlayerAt(c.x, c.y); if (hitP) this.applyDamage(player.id, hitP, attack.damage); }
+      const extra = this.triggerBarrelChain(player.id, affected);
+      affected = affected.concat(extra);
+      if (attack.moveSelf) {
+        const dest = cells[cells.length - 1] || { x: player.x, y: player.y };
+        const occupied = Object.values(this.players).some(p => p.alive && p.id !== player.id && p.x === dest.x && p.y === dest.y);
+        if (!occupied && !this.isBlocked(dest.x, dest.y)) { player.x = dest.x; player.y = dest.y; }
+      }
     } else if (attack.target === "self" && attack.shield) {
       player.shield = true;
       affected = [{ x: player.x, y: player.y }];
@@ -769,7 +797,8 @@ class Room {
     if (this.status !== "playing") return;
 
     if (this.shrinkEnabled) {
-      if (this.shrinkRadius > SHRINK_MIN_RADIUS && Date.now() - this.lastShrinkAt >= SHRINK_INTERVAL_MS) {
+      if (this.shrinkMode !== "onKO" && this.shrinkRadius > SHRINK_MIN_RADIUS &&
+          Date.now() - this.lastShrinkAt >= this.shrinkIntervalSec * 1000) {
         this.shrinkRadius -= 1;
         this.lastShrinkAt = Date.now();
         this.pushLog("⚠️ La zone se rétrécit !");
@@ -985,7 +1014,7 @@ server.on("upgrade", (req, socket, head) => {
 
     const room = getOrCreateRoom(code);
     const player = room.addPlayer(ws, pseudo, clientId);
-    if (!player) { ws.send(JSON.stringify({ type: "error", message: "Partie pleine (6 joueurs max)." })); ws.close(1008, "full"); return; }
+    if (!player) { ws.send(JSON.stringify({ type: "error", message: "Partie pleine — 6 joueurs max." })); ws.close(1008, "full"); return; }
 
     ws.send(JSON.stringify({ type: "welcome", playerId: player.id, code: room.code, modes: MODES, maps: MAPS }));
     room.pushLog(`${pseudo} a rejoint la partie.`);
