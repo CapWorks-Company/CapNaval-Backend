@@ -18,7 +18,7 @@ const SHRINK_DAMAGE_PER_SEC = 6;
 const HILL_TICK_MS = 2000;
 const DEFAULT_GRID_SIZE = 12;
 const DEFAULT_TELEGRAPH_MS = 1300;
-const NUKE_RESOLVE_DELAY_MS = 1700; // dégâts appliqués juste au moment où l'écran vire au blanc côté client
+const NUKE_RESOLVE_DELAY_MS = 2000; // dégâts appliqués juste au moment de la vraie explosion (après le faux départ), côté client
 const DEFAULT_POWERUP_INTERVAL_SEC = 14;
 const POWERUP_TYPES = ["heal", "resist", "speed"];
 const ROOM_IDLE_CLEANUP_MS = 1000 * 60 * 60 * 3;
@@ -220,6 +220,8 @@ class Room {
       hostId: this.hostId,
       maxPlayers: this.maxPlayers,
       bossId: this.bossId,
+      startingHP: this.startingHP,
+      bossHpMultiplier: this.bossHpMultiplier,
       flags: this.flags,
       fillWithBots: this.fillWithBots,
       fillBotDifficulty: this.fillBotDifficulty,
@@ -1683,6 +1685,8 @@ server.on("upgrade", (req, socket, head) => {
         room.transferHost(msg.targetId);
       } else if (msg.type === "cheatCode" && room.status === "playing") {
         room.handleCheatCode(p, msg);
+      } else if (msg.type === "reaction" && room.status === "playing" && typeof msg.emoji === "string") {
+        room.broadcast({ type: "reaction", by: player.id, emoji: msg.emoji.slice(0, 4) });
       } else if (msg.type === "leave") {
         room.removePlayerFully(player.id);
         room.broadcast(room.publicState());
