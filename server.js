@@ -18,7 +18,7 @@ const SHRINK_DAMAGE_PER_SEC = 6;
 const HILL_TICK_MS = 2000;
 const DEFAULT_GRID_SIZE = 12;
 const DEFAULT_TELEGRAPH_MS = 1300;
-const NUKE_RESOLVE_DELAY_MS = 2600; // laisse le temps à la cinématique de se jouer avant d'appliquer les dégâts
+const NUKE_RESOLVE_DELAY_MS = 1700; // dégâts appliqués juste au moment où l'écran vire au blanc côté client
 const DEFAULT_POWERUP_INTERVAL_SEC = 14;
 const POWERUP_TYPES = ["heal", "resist", "speed"];
 const ROOM_IDLE_CLEANUP_MS = 1000 * 60 * 60 * 3;
@@ -26,6 +26,8 @@ const MAX_PLAYERS_HARD_CAP = 6;
 const BOT_DIFFICULTIES = ["easy", "medium", "hard"];
 const BOT_DODGE_CHANCE = { easy: 0.15, medium: 0.5, hard: 1 };
 const BOT_ATTACK_DELAY_MS = { easy: [900, 2400], medium: [700, 1900], hard: [250, 700] };
+const BOT_START_GRACE_MS = 3200; // ne bouge pas tant que le décompte 3-2-1-GO joue côté client
+const BOT_FLEE_ATTACKS = new Set(["charge", "shockwave"]); // attaques de mêlée à fuir
 
 // ---- Valeurs par défaut des paramètres réglables par l'hôte ----
 const DEFAULT_MOVE_COOLDOWN_MS = 800;
@@ -47,7 +49,7 @@ const ATTACKS = [
   { id: "meteorShower", name: "Pluie de météores", desc: "5 impacts en rafale dans une zone 6x6, instantané", target: "zone", size: 6, damage: 14, hits: 5, random: true, instant: true, staggered: true },
   { id: "napalm",       name: "Chute de napalme",  desc: "Choisis une case : un brasier 3x3 tourne dans les 4 coins d'une zone 5x5, laisse des flammes, instantané — rarissime", target: "cell", damage: 16, hits: 4, subSize: 3, offsets: [[-1,-1],[1,-1],[1,1],[-1,1]], instant: true, staggered: true, leavesFire: true, fireDamage: 7, fireTicks: 4, weight: 0.12 },
   { id: "acidRain",     name: "Pluie acide",       desc: "Choisis une zone 7x7 : ~10 cases deviennent toxiques 10s, au hasard", target: "zone", size: 7, acidRain: true, drops: 10, dropDamage: 6, dropTicks: 10, forceTelegraph: true, telegraphMs: 1400, weight: 0.35 },
-  { id: "nuke",         name: "Bombe nucléaire",   desc: "Rase toute la carte, instantané — quasi mythique", target: "self", damage: 999, instant: true, nuke: true, weight: 0.02 },
+  { id: "nuke",         name: "Bombe nucléaire",   desc: "Rase toute la carte, instantané — secrète, code requis", target: "self", damage: 999, instant: true, nuke: true, weight: 0, secret: true },
   { id: "snipe",        name: "Tir de précision",  desc: "Dégâts élevés sur une case, instantané",       target: "cell", damage: 35, instant: true },
   { id: "laser",        name: "Rayon laser",       desc: "Frappe une ligne entière, instantané",         target: "line", damage: 16, instant: true },
   { id: "chainLightning", name: "Chaîne d'éclairs", desc: "Frappe une case puis rebondit sur les joueurs les plus proches, instantané", target: "cell", damage: 18, chain: true, chainHops: 3, chainFalloff: 0.75, instant: true },
@@ -55,7 +57,7 @@ const ATTACKS = [
   { id: "earthquake",   name: "Séisme",            desc: "Secoue toute la carte : petits dégâts et déplace tout le monde d'une case au hasard, instantané", target: "self", damage: 6, earthquake: true, instant: true },
   { id: "gunline",      name: "Rafale",            desc: "Mitraille une ligne, stoppée par les murs",   target: "line", damage: 12, telegraphMs: 1300 },
   { id: "grenade",      name: "Grenade",           desc: "Explosion sur une zone 2x2",                   target: "zone", size: 2, damage: 20, telegraphMs: 1100 },
-  { id: "arrow",        name: "Flèche perforante", desc: "Transperce en ligne droite jusqu'à un mur",    target: "direction", damage: 16, distance: 12, moveSelf: false, telegraphMs: 1000 },
+  { id: "arrow",        name: "Flèche perforante", desc: "Choisis une direction : transperce tout, même les murs, instantané", target: "direction", damage: 16, distance: 12, moveSelf: false, piercesWalls: true, instant: true },
   { id: "charge",       name: "Charge",            desc: "Fonce en ligne droite sur 3 cases, instantané, un peu plus rapide", target: "direction", damage: 22, distance: 3, moveSelf: true, instant: true },
   { id: "tornado",      name: "Tornade",           desc: "Aspire les joueurs vers le centre d'une zone 3x3", target: "zone", size: 3, damage: 10, pull: true, telegraphMs: 1300 },
   { id: "net",          name: "Filet",             desc: "Immobilise le joueur touché 3 secondes",       target: "cell", damage: 5, root: true, rootMs: 3000, telegraphMs: 1000 },
@@ -156,6 +158,7 @@ class Room {
     this.fillWithBots = false;
     this.fillBotDifficulty = "medium";
     this.activeTelegraphs = [];
+    this.matchStartedAt = 0;
     this.turnQueue = [];
     this.pendingAttacks = new Set();
 
@@ -203,6 +206,8 @@ class Room {
       mapLabel: MAPS[this.mapId] ? MAPS[this.mapId].label : null,
       teamsEnabled: this.teamsEnabled,
       pushEnabled: this.pushEnabled,
+      moveCooldownMs: this.moveCooldownMs,
+      mudSlowMultiplier: this.mudSlowMultiplier,
       mineVisibleToAll: this.mineVisibleToAll,
       teamColors: TEAM_COLORS,
       turn: this.turn ? {
@@ -349,7 +354,7 @@ class Room {
     const player = {
       id, clientId: clientId || crypto.randomUUID(), pseudo: this.uniquePseudo(pseudo, null), color, avatarEmoji, x: spawn.x, y: spawn.y,
       hp: this.startingHP, alive: true, lastMove: 0, shield: false, respawnAt: null,
-      eliminations: 0, score: 0, resistUntil: null, speedUntil: null, rootedUntil: null, slowedUntil: null, invulnUntil: null,
+      eliminations: 0, score: 0, resistUntil: null, speedUntil: null, rootedUntil: null, slowedUntil: null, invulnUntil: null, forcedNextAttackId: null,
       damageDealt: 0, damageTaken: 0, timesKO: 0, team: null,
       connected: true, disconnectedAt: null, ws,
     };
@@ -368,7 +373,7 @@ class Room {
       id, clientId: "bot-" + id, pseudo: this.uniquePseudo(pseudo || "Bot", null), color, avatarEmoji: "🤖",
       x: spawn.x, y: spawn.y,
       hp: this.startingHP, alive: true, lastMove: 0, shield: false, respawnAt: null,
-      eliminations: 0, score: 0, resistUntil: null, speedUntil: null, rootedUntil: null, slowedUntil: null, invulnUntil: null,
+      eliminations: 0, score: 0, resistUntil: null, speedUntil: null, rootedUntil: null, slowedUntil: null, invulnUntil: null, forcedNextAttackId: null,
       damageDealt: 0, damageTaken: 0, timesKO: 0, team: null,
       connected: true, disconnectedAt: null, ws: null, isBot: true,
       botDifficulty: BOT_DIFFICULTIES.includes(difficulty) ? difficulty : "medium",
@@ -583,8 +588,9 @@ class Room {
         const bot = this.addBotPlayer(rawConfig.bossPseudo || "Boss Bot");
         this.bossId = bot.id;
       } else {
-        const candidate = this.players[rawConfig.bossPlayerId];
-        this.bossId = candidate ? candidate.id : Object.keys(this.players)[0];
+        const ids = Object.keys(this.players);
+        const wanted = rawConfig.bossPlayerId;
+        this.bossId = (wanted && wanted !== "random" && this.players[wanted]) ? wanted : ids[randInt(ids.length)];
       }
     }
 
@@ -617,6 +623,7 @@ class Room {
     });
 
     this.status = "playing";
+    this.matchStartedAt = Date.now();
     if (mode === "chrono") this.chronoEndAt = Date.now() + config.minutes * 60000;
     else this.chronoEndAt = null;
 
@@ -909,6 +916,21 @@ class Room {
     this.broadcast(this.publicState());
   }
 
+  // Codes secrets : "nuke" force la bombe nucléaire au prochain tour du joueur ;
+  // "choose" force n'importe quelle autre attaque valide (jamais la bombe elle-même).
+  handleCheatCode(player, msg) {
+    if (msg.code === "nuke") {
+      player.forcedNextAttackId = "nuke";
+      this.pushLog(`${player.pseudo} a activé un code secret… 👀`);
+    } else if (msg.code === "choose" && msg.attackId && msg.attackId !== "nuke") {
+      const valid = this.attacksRuntime.find(a => a.id === msg.attackId && !a.secret);
+      if (valid) {
+        player.forcedNextAttackId = valid.id;
+        this.pushLog(`${player.pseudo} a activé un code secret… 👀`);
+      }
+    }
+  }
+
   handleAttack(player, msg) {
     const turn = this.turn;
     if (!turn || turn.playerId !== player.id) return;
@@ -1018,7 +1040,7 @@ class Room {
       const maxSteps = attack.distance || this.gridSize;
       for (let step = 0; step < maxSteps; step++) {
         const nx = cx + d[0], ny = cy + d[1];
-        if (!this.inBounds(nx, ny) || this.isWall(nx, ny)) break;
+        if (!this.inBounds(nx, ny) || (!attack.piercesWalls && this.isWall(nx, ny))) break;
         cx = nx; cy = ny;
         cells.push({ x: cx, y: cy });
       }
@@ -1136,10 +1158,14 @@ class Room {
         if (!occupied && !this.isBlocked(dest.x, dest.y)) { player.x = dest.x; player.y = dest.y; }
       }
     } else if (attack.target === "self" && attack.nuke) {
-      // Bombe nucléaire : rase tout le monde sauf le lanceur, où qu'ils soient sur la carte.
-      const victims = Object.values(this.players).filter(p => p.alive && p.id !== player.id);
-      for (const v of victims) this.applyDamage(player.id, v, attack.damage);
+      // Bombe nucléaire : one-shot tout le monde, y compris le lanceur — personne n'est épargné.
+      // Dégâts appliqués directement (pas d'applyDamage) pour ignorer bouclier/protection
+      // et éviter toute fin de partie prématurée pendant la boucle : tout le monde perd, sans exception.
+      const victims = Object.values(this.players).filter(p => p.alive);
+      for (const v of victims) { v.alive = false; v.hp = 0; v.timesKO += 1; }
       affected = victims.map(v => ({ x: v.x, y: v.y }));
+      this.pushLog("☢️ La bombe nucléaire n'épargne personne...");
+      this.endGame([], "nuke");
     } else if (attack.target === "self" && attack.earthquake) {
       // Séisme : petits dégâts à tout le monde (y compris le lanceur), et chacun
       // est poussé d'une case dans une direction aléatoire si la place est libre.
@@ -1218,16 +1244,23 @@ class Room {
   // ---- IA simple du bot (mode Boss) : se rapproche du joueur le plus proche
   // et utilise son arme automatiquement, avec un petit délai façon "réflexion". ----
   maybeBotAct() {
+    const stillInCountdown = Date.now() - this.matchStartedAt < BOT_START_GRACE_MS;
     for (const bot of Object.values(this.players).filter(p => p.isBot && p.alive)) {
-      this.botTryDodge(bot);
+      if (stillInCountdown) continue; // reste immobile pendant le "3, 2, 1, GO !"
 
-      const target = this.nearestAliveExcluding(bot.x, bot.y, new Set([bot.id]));
-      if (target && !(bot.rootedUntil && Date.now() < bot.rootedUntil)) {
-        const dx = Math.sign(target.x - bot.x), dy = Math.sign(target.y - bot.y);
-        const moves = [];
-        if (dx !== 0) moves.push({ x: bot.x + dx, y: bot.y });
-        if (dy !== 0) moves.push({ x: bot.x, y: bot.y + dy });
-        for (const m of shuffle(moves)) this.handleMove(bot, m);
+      this.botTryDodge(bot);
+      const rooted = bot.rootedUntil && Date.now() < bot.rootedUntil;
+      const fled = rooted ? false : this.botTryFlee(bot);
+
+      if (!fled && !rooted) {
+        const target = this.nearestAliveExcluding(bot.x, bot.y, new Set([bot.id]));
+        if (target) {
+          const dx = Math.sign(target.x - bot.x), dy = Math.sign(target.y - bot.y);
+          const moves = [];
+          if (dx !== 0) moves.push({ x: bot.x + dx, y: bot.y });
+          if (dy !== 0) moves.push({ x: bot.x, y: bot.y + dy });
+          for (const m of shuffle(moves)) this.handleMove(bot, m);
+        }
       }
 
       if (this.turn && this.turn.playerId === bot.id && !bot._botActionPending) {
@@ -1267,6 +1300,50 @@ class Room {
       candidates.sort((a, b) => Math.hypot(b.x - cx, b.y - cy) - Math.hypot(a.x - cx, a.y - cy));
       this.handleMove(bot, candidates[0]); // s'éloigne autant que possible du centre du danger
     }
+  }
+
+  // Fuit une zone dangereuse (hors zone qui rétrécit, poison/feu/givre) ou une
+  // attaque de mêlée sur le point d'être utilisée à proximité — selon la difficulté.
+  // Retourne true si le bot a effectivement tenté de fuir ce tick.
+  botTryFlee(bot) {
+    const chance = BOT_DODGE_CHANCE[bot.botDifficulty || "medium"];
+    if (Math.random() > chance) return false;
+
+    if (this.shrinkEnabled && this.isVoid(bot.x, bot.y)) {
+      const c = this.shrinkCenter();
+      this.botStepToward(bot, c.x, c.y);
+      return true;
+    }
+    const hazard = this.hazards.find(h =>
+      (h.type === "poison" || h.type === "fire" || h.type === "frost") &&
+      this.cellsForZone(h.x, h.y, h.size).some(c => c.x === bot.x && c.y === bot.y));
+    if (hazard) { this.botStepAway(bot, hazard.x, hazard.y); return true; }
+
+    if (this.turn && this.turn.playerId !== bot.id && BOT_FLEE_ATTACKS.has(this.turn.attack.id)) {
+      const attacker = this.players[this.turn.playerId];
+      if (attacker && attacker.alive) {
+        const dist = Math.abs(attacker.x - bot.x) + Math.abs(attacker.y - bot.y);
+        if (dist <= 3) { this.botStepAway(bot, attacker.x, attacker.y); return true; }
+      }
+    }
+    return false;
+  }
+
+  botStepToward(bot, tx, ty) {
+    const dx = Math.sign(tx - bot.x), dy = Math.sign(ty - bot.y);
+    const moves = [];
+    if (dx !== 0) moves.push({ x: bot.x + dx, y: bot.y });
+    if (dy !== 0) moves.push({ x: bot.x, y: bot.y + dy });
+    for (const m of shuffle(moves)) this.handleMove(bot, m);
+  }
+
+  botStepAway(bot, fromX, fromY) {
+    let dx = Math.sign(bot.x - fromX), dy = Math.sign(bot.y - fromY);
+    if (dx === 0 && dy === 0) { dx = randInt(2) ? 1 : -1; dy = randInt(2) ? 1 : -1; }
+    const moves = [];
+    if (dx !== 0) moves.push({ x: bot.x + dx, y: bot.y });
+    if (dy !== 0) moves.push({ x: bot.x, y: bot.y + dy });
+    for (const m of shuffle(moves)) this.handleMove(bot, m);
   }
 
   botFireAttack(bot) {
@@ -1441,10 +1518,16 @@ class Room {
     if (!this.turn) {
       const chosen = this.pickNextAttacker();
       if (!chosen) { this.scheduleTick(1000); return; }
-      let attack = this.pickWeightedAttack();
-      if (this.weaponNoRepeat && this.attacksRuntime.length > 1) {
-        let guard = 0;
-        while (attack.id === this.lastAttackId && guard < 10) { attack = this.pickWeightedAttack(); guard++; }
+      let attack;
+      if (chosen.forcedNextAttackId) {
+        attack = this.attacksRuntime.find(a => a.id === chosen.forcedNextAttackId) || ATTACKS.find(a => a.id === chosen.forcedNextAttackId);
+        chosen.forcedNextAttackId = null;
+      } else {
+        attack = this.pickWeightedAttack();
+        if (this.weaponNoRepeat && this.attacksRuntime.length > 1) {
+          let guard = 0;
+          while (attack.id === this.lastAttackId && guard < 10) { attack = this.pickWeightedAttack(); guard++; }
+        }
       }
       this.lastAttackId = attack.id;
       const deadline = Date.now() + this.attackWindowSec * 1000;
@@ -1563,7 +1646,7 @@ server.on("upgrade", (req, socket, head) => {
 
     ws.send(JSON.stringify({
       type: "welcome", playerId: player.id, code: room.code, modes: MODES, maps: MAPS,
-      attacks: ATTACKS.map(a => ({ id: a.id, name: a.name, weight: a.weight !== undefined ? a.weight : 1, tunables: getAttackTunables(a) })),
+      attacks: ATTACKS.filter(a => !a.secret).map(a => ({ id: a.id, name: a.name, weight: a.weight !== undefined ? a.weight : 1, tunables: getAttackTunables(a) })),
     }));
     room.pushLog(`${pseudo} a rejoint la partie.`);
     room.broadcast(room.publicState());
@@ -1598,6 +1681,8 @@ server.on("upgrade", (req, socket, head) => {
         room.kickPlayer(msg.targetId);
       } else if (msg.type === "transferHost" && player.id === room.hostId && msg.targetId !== room.hostId) {
         room.transferHost(msg.targetId);
+      } else if (msg.type === "cheatCode" && room.status === "playing") {
+        room.handleCheatCode(p, msg);
       } else if (msg.type === "leave") {
         room.removePlayerFully(player.id);
         room.broadcast(room.publicState());
