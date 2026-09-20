@@ -4,48 +4,54 @@ const { WebSocketServer } = require("ws");
 const crypto = require("crypto");
 
 const GRID_SIZE = 12;
-const MOVE_COOLDOWN_MS = 800;
 const MUD_COOLDOWN_MULT = 2;
 const SPEED_COOLDOWN_MULT = 0.5;
 const RESIST_DAMAGE_MULT = 0.5;
 const BUFF_DURATION_MS = 10000;
-const ATTACK_WINDOW_MS = 12000;
-const TURN_GAP_MS = 2500;
-const START_HP = 100;
-const RESPAWN_DELAY_MS = 4000;
-const MAX_PLAYERS = 6;
-const ROOM_IDLE_CLEANUP_MS = 1000 * 60 * 60 * 3;
+const RECONNECT_GRACE_MS = 90000; // 90s pour se reconnecter avant d'être retiré pour de bon
+const SHRINK_PRESETS_SEC = { slow: 30, medium: 18, fast: 9 };
+const SHRINK_MODES = ["slow", "medium", "fast", "onKO", "custom"];
+const SHRINK_INITIAL_RADIUS = 6;
+const SHRINK_MIN_RADIUS = 1;
+const SHRINK_DAMAGE_PER_SEC = 6;
 const HILL_TICK_MS = 2000;
 const HILL_CELLS = [[5, 5], [5, 6], [6, 5], [6, 6]];
 const DEFAULT_TELEGRAPH_MS = 1300;
-const BARREL_DAMAGE = 22;
-const MAX_POWERUPS_ON_MAP = 3;
 const DEFAULT_POWERUP_INTERVAL_SEC = 14;
 const POWERUP_TYPES = ["heal", "resist", "speed"];
-const RECONNECT_GRACE_MS = 90000; // 90s pour se reconnecter avant d'être retiré pour de bon
-const SHRINK_PRESETS_SEC = { slow: 30, medium: 18, fast: 9 }; // vitesses prédéfinies
-const SHRINK_MODES = ["slow", "medium", "fast", "onKO", "custom"];
-const SHRINK_INITIAL_RADIUS = 6;  // couvre toute la grille 12x12 au départ
-const SHRINK_MIN_RADIUS = 1;
-const SHRINK_DAMAGE_PER_SEC = 6;
+const ROOM_IDLE_CLEANUP_MS = 1000 * 60 * 60 * 3;
+const MAX_PLAYERS_HARD_CAP = 6;
+
+// ---- Valeurs par défaut des paramètres réglables par l'hôte ----
+const DEFAULT_MOVE_COOLDOWN_MS = 800;
+const DEFAULT_ATTACK_WINDOW_SEC = 12;
+const DEFAULT_TURN_GAP_SEC = 2.5;
+const DEFAULT_START_HP = 100;
+const DEFAULT_RESPAWN_DELAY_SEC = 4;
+const DEFAULT_RESPAWN_HP_PERCENT = 50;
+const DEFAULT_DAMAGE_MULTIPLIER = 1;
+const DEFAULT_BARREL_DAMAGE = 22;
+const DEFAULT_POWERUP_MAX_ON_MAP = 3;
 
 const COLORS = ["#ef4444", "#3b82f6", "#22c55e", "#eab308", "#a855f7", "#f97316"];
 const TEAM_COLORS = { A: "#ef4444", B: "#3b82f6" };
 
 const ATTACKS = [
   { id: "meteor",       name: "Météorite",         desc: "Frappe une zone 3x3 choisie",                 target: "zone", size: 3, damage: 25, telegraphMs: 1300 },
-  { id: "airstrike",    name: "Frappe aérienne",   desc: "3 impacts aléatoires dans une zone 5x5",       target: "zone", size: 5, damage: 15, hits: 3, random: true, telegraphMs: 1500 },
-  { id: "meteorShower", name: "Pluie de météores", desc: "5 impacts aléatoires dans une zone 6x6",       target: "zone", size: 6, damage: 14, hits: 5, random: true, telegraphMs: 2000 },
+  { id: "airstrike",    name: "Frappe aérienne",   desc: "3 impacts en rafale dans une zone 5x5, instantané", target: "zone", size: 5, damage: 15, hits: 3, random: true, instant: true, staggered: true },
+  { id: "meteorShower", name: "Pluie de météores", desc: "5 impacts en rafale dans une zone 6x6, instantané", target: "zone", size: 6, damage: 14, hits: 5, random: true, instant: true, staggered: true },
+  { id: "napalm",       name: "Chute de napalme",  desc: "4 explosions 3x3 en rafale, instantané — rarissime", target: "zone", size: 7, damage: 16, hits: 4, subSize: 3, random: true, instant: true, staggered: true, weight: 0.12 },
+  { id: "acidRain",     name: "Pluie acide",       desc: "Choisis une zone 7x7 : ~10 cases deviennent toxiques 10s, au hasard", target: "zone", size: 7, acidRain: true, drops: 10, dropDamage: 6, dropTicks: 10, forceTelegraph: true, telegraphMs: 1400, weight: 0.35 },
   { id: "snipe",        name: "Tir de précision",  desc: "Dégâts élevés sur une case, instantané",       target: "cell", damage: 35, instant: true },
   { id: "laser",        name: "Rayon laser",       desc: "Frappe une ligne entière, instantané",         target: "line", damage: 16, instant: true },
-  { id: "shockwave",    name: "Onde de choc",      desc: "Frappe toutes les cases autour de toi",        target: "self", damage: 18, telegraphMs: 1100 },
+  { id: "shockwave",    name: "Onde de choc",      desc: "Frappe toutes les cases autour de toi, instantané", target: "self", damage: 18, instant: true },
   { id: "gunline",      name: "Rafale",            desc: "Mitraille une ligne, stoppée par les murs",   target: "line", damage: 12, telegraphMs: 1300 },
   { id: "grenade",      name: "Grenade",           desc: "Explosion sur une zone 2x2",                   target: "zone", size: 2, damage: 20, telegraphMs: 1100 },
   { id: "arrow",        name: "Flèche perforante", desc: "Transperce en ligne droite jusqu'à un mur",    target: "direction", damage: 16, distance: 12, moveSelf: false, telegraphMs: 1000 },
-  { id: "charge",       name: "Charge",            desc: "Fonce en ligne droite sur 2 cases, instantané",target: "direction", damage: 22, distance: 2, moveSelf: true, instant: true },
+  { id: "charge",       name: "Charge",            desc: "Fonce en ligne droite sur 3 cases, instantané, un peu plus rapide", target: "direction", damage: 22, distance: 3, moveSelf: true, instant: true },
   { id: "tornado",      name: "Tornade",           desc: "Aspire les joueurs vers le centre d'une zone 3x3", target: "zone", size: 3, damage: 10, pull: true, telegraphMs: 1300 },
   { id: "net",          name: "Filet",             desc: "Immobilise le joueur touché 3 secondes",       target: "cell", damage: 5, root: true, rootMs: 3000, telegraphMs: 1000 },
-  { id: "frost",        name: "Vague de givre",    desc: "Ralentit et blesse légèrement une zone 3x3",   target: "zone", size: 3, damage: 8, slow: true, slowMs: 6000, telegraphMs: 1200 },
+  { id: "frost",        name: "Vague de givre",    desc: "Ralentit et blesse une zone 3x3, laisse une trace glacée",   target: "zone", size: 3, damage: 8, slow: true, slowMs: 1500, traceTicks: 6, telegraphMs: 1200 },
   { id: "mine",         name: "Piège explosif",    desc: "Pose une mine invisible sur une case",         target: "cell", damage: 30, trap: true },
   { id: "heal",         name: "Soin d'urgence",    desc: "Soigne toi ou un allié proche",                target: "ally", heal: 25 },
   { id: "shield",       name: "Bouclier",          desc: "Absorbe la prochaine attaque reçue",           target: "self", shield: true },
@@ -65,10 +71,12 @@ const MAPS = {
   ruins:   { label: "Ruines",         desc: "Des murs pour se mettre à couvert.",                walls: 14, barrels: 4,  mud: 0 },
   swamp:   { label: "Marécage",       desc: "Des flaques de boue ralentissent les déplacements.",walls: 6,  barrels: 2,  mud: 12 },
   arsenal: { label: "Arsenal",        desc: "Beaucoup de tonneaux explosifs, réaction en chaîne.",walls: 8,  barrels: 14, mud: 0 },
+  custom:  { label: "Personnalisé",   desc: "Ta carte, conçue et enregistrée par toi.",          walls: 0,  barrels: 0,  mud: 0 },
 };
 
 function randInt(n) { return Math.floor(Math.random() * n); }
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+function numOr(v, def) { const n = parseFloat(v); return Number.isFinite(n) ? n : def; }
 function inBounds(x, y) { return x >= 0 && y >= 0 && x < GRID_SIZE && y < GRID_SIZE; }
 function genCode() {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -77,6 +85,11 @@ function genCode() {
   return s;
 }
 function onHill(x, y) { return HILL_CELLS.some(([hx, hy]) => hx === x && hy === y); }
+function shuffle(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) { const j = randInt(i + 1); [a[i], a[j]] = [a[j], a[i]]; }
+  return a;
+}
 
 class Room {
   constructor(code) {
@@ -89,6 +102,7 @@ class Room {
     this.mapId = "open";
     this.powerupsEnabled = true;
     this.powerupIntervalSec = DEFAULT_POWERUP_INTERVAL_SEC;
+    this.powerupMaxOnMap = DEFAULT_POWERUP_MAX_ON_MAP;
     this.lastPowerupSpawn = 0;
     this.teamsEnabled = false;
     this.pushEnabled = true;
@@ -98,6 +112,7 @@ class Room {
     this.shrinkRadius = SHRINK_INITIAL_RADIUS;
     this.lastShrinkAt = 0;
     this.isPublic = false;
+    this.maxPlayers = MAX_PLAYERS_HARD_CAP;
     this.turn = null;
     this.hostId = null;
     this.timer = null;
@@ -105,8 +120,20 @@ class Room {
     this.secondTimer = null;
     this.lastActivity = Date.now();
     this.lastAttackId = null;
-    this.turnQueue = []; // "sac" de joueurs restants à faire jouer avant de remélanger
+    this.turnQueue = [];
     this.pendingAttacks = new Set();
+
+    // ---- Paramètres réglables par l'hôte ----
+    this.moveCooldownMs = DEFAULT_MOVE_COOLDOWN_MS;
+    this.attackWindowSec = DEFAULT_ATTACK_WINDOW_SEC;
+    this.turnGapSec = DEFAULT_TURN_GAP_SEC;
+    this.startingHP = DEFAULT_START_HP;
+    this.respawnDelaySec = DEFAULT_RESPAWN_DELAY_SEC;
+    this.respawnHpPercent = DEFAULT_RESPAWN_HP_PERCENT;
+    this.damageMultiplier = DEFAULT_DAMAGE_MULTIPLIER;
+    this.barrelDamage = DEFAULT_BARREL_DAMAGE;
+    this.weaponNoRepeat = true;
+    this.mineVisibleToAll = false;
 
     this.mode = null;
     this.config = {};
@@ -128,13 +155,14 @@ class Room {
       type: "state",
       status: this.status,
       players: Object.values(this.players).map(({ ws, clientId, disconnectedAt, ...rest }) => rest),
-      hazards: this.hazards.map(h => h.type === "mine" ? { x: h.x, y: h.y, type: "mine" } : h),
+      hazards: this.hazards.map(h => h.type === "mine" ? { x: h.x, y: h.y, type: "mine", ownerId: h.ownerId } : h),
       powerups: this.powerups,
       obstacles: this.obstacles,
       mapId: this.mapId,
       mapLabel: MAPS[this.mapId] ? MAPS[this.mapId].label : null,
       teamsEnabled: this.teamsEnabled,
       pushEnabled: this.pushEnabled,
+      mineVisibleToAll: this.mineVisibleToAll,
       teamColors: TEAM_COLORS,
       turn: this.turn ? {
         playerId: this.turn.playerId,
@@ -144,6 +172,7 @@ class Room {
       } : null,
       gridSize: GRID_SIZE,
       hostId: this.hostId,
+      maxPlayers: this.maxPlayers,
       mode: this.mode,
       modeLabel: this.mode ? MODES[this.mode].label : null,
       config: this.config,
@@ -192,13 +221,32 @@ class Room {
     this.mapId = MAPS[mapId] ? mapId : "open";
   }
 
+  // Carte conçue par l'hôte (enregistrée en local côté client, envoyée au lancement).
+  // Sécurité : au moins 12 cases praticables (murs+tonneaux exclus), sinon repli sur "open".
+  useCustomMap(customMap, excludeCells) {
+    customMap = customMap || {};
+    const excludeSet = new Set((excludeCells || []).map(c => `${c.x},${c.y}`));
+    const used = new Set();
+    const cleanList = (arr) => (Array.isArray(arr) ? arr : [])
+      .filter(c => c && Number.isInteger(c.x) && Number.isInteger(c.y) && inBounds(c.x, c.y) && !excludeSet.has(`${c.x},${c.y}`))
+      .slice(0, 130)
+      .filter(c => { const k = `${c.x},${c.y}`; if (used.has(k)) return false; used.add(k); return true; });
+
+    const walls = cleanList(customMap.walls);
+    const barrels = cleanList(customMap.barrels).map(c => ({ x: c.x, y: c.y, id: crypto.randomUUID() }));
+    const mud = cleanList(customMap.mud);
+    const freeWalkable = GRID_SIZE * GRID_SIZE - walls.length - barrels.length;
+    if (freeWalkable < 12) { this.generateMap("open", excludeCells); return; }
+    this.obstacles = { walls, barrels, mud };
+    this.mapId = "custom";
+  }
+
   freeSpawn() {
     for (let tries = 0; tries < 200; tries++) {
       const x = randInt(GRID_SIZE), y = randInt(GRID_SIZE);
       const occupied = Object.values(this.players).some(p => p.alive && p.x === x && p.y === y);
       if (!occupied && !this.isBlocked(x, y) && !this.isVoid(x, y)) return { x, y };
     }
-    // repli : ignore la zone dangereuse si aucune case sûre n'est trouvée
     for (let tries = 0; tries < 200; tries++) {
       const x = randInt(GRID_SIZE), y = randInt(GRID_SIZE);
       const occupied = Object.values(this.players).some(p => p.alive && p.x === x && p.y === y);
@@ -219,14 +267,14 @@ class Room {
         return existing;
       }
     }
-    if (Object.keys(this.players).length >= MAX_PLAYERS) return null;
+    if (Object.keys(this.players).length >= this.maxPlayers) return null;
     const id = crypto.randomUUID();
     const usedColors = Object.values(this.players).map(p => p.color);
     const color = COLORS.find(c => !usedColors.includes(c)) || COLORS[randInt(COLORS.length)];
     const spawn = this.freeSpawn();
     const player = {
       id, clientId: clientId || crypto.randomUUID(), pseudo, color, x: spawn.x, y: spawn.y,
-      hp: START_HP, alive: true, lastMove: 0, shield: false, respawnAt: null,
+      hp: this.startingHP, alive: true, lastMove: 0, shield: false, respawnAt: null,
       eliminations: 0, score: 0, resistUntil: null, speedUntil: null, rootedUntil: null, slowedUntil: null,
       damageDealt: 0, damageTaken: 0, timesKO: 0, team: null,
       connected: true, disconnectedAt: null, ws,
@@ -249,9 +297,6 @@ class Room {
     }
   }
 
-  // Départ volontaire ("Quitter") : retrait immédiat et définitif, quel que soit
-  // le statut de la partie (contrairement à handleDisconnect qui garde une chance
-  // de reconnexion en cas de coupure réseau pendant une partie en cours).
   removePlayerFully(id) {
     const p = this.players[id];
     if (!p) return;
@@ -259,6 +304,30 @@ class Room {
     delete this.players[id];
     if (this.hostId === id) this.hostId = Object.keys(this.players)[0] || null;
     if (this.status === "playing") this.checkWinCondition();
+  }
+
+  // Exclusion par l'hôte : notifie le joueur visé puis le retire définitivement.
+  kickPlayer(targetId) {
+    const p = this.players[targetId];
+    if (!p) return;
+    if (p.ws && p.ws.readyState === 1) {
+      try { p.ws.send(JSON.stringify({ type: "kicked" })); } catch (e) { /* ignore */ }
+      try { p.ws.close(1000, "kicked"); } catch (e) { /* ignore */ }
+    }
+    this.pushLog(`${p.pseudo} a été exclu par l'hôte.`);
+    delete this.players[targetId];
+    if (this.hostId === targetId) this.hostId = Object.keys(this.players)[0] || null;
+    if (this.status === "playing") this.checkWinCondition();
+    this.broadcast(this.publicState());
+  }
+
+  // Transfert de la propriété du salon à un autre joueur connecté.
+  transferHost(targetId) {
+    const p = this.players[targetId];
+    if (!p || !p.connected) return;
+    this.hostId = targetId;
+    this.pushLog(`${p.pseudo} est désormais l'hôte.`);
+    this.broadcast(this.publicState());
   }
 
   purgeStaleDisconnected() {
@@ -271,7 +340,6 @@ class Room {
     }
   }
 
-  // ---- L'hôte termine la partie en cours et ramène tout le monde au salon ----
   abortToLobby() {
     if (this.status === "lobby") return;
     this.status = "lobby";
@@ -293,7 +361,6 @@ class Room {
   // ---- Démarrage / relance ----
   start(mode, rawConfig) {
     if (this.status === "playing") return;
-    // les joueurs qui n'ont jamais reconnecté depuis la partie précédente sont abandonnés
     for (const [id, p] of Object.entries(this.players)) {
       if (!p.connected) { delete this.players[id]; if (this.hostId === id) this.hostId = Object.keys(this.players)[0] || null; }
     }
@@ -323,6 +390,20 @@ class Room {
       : (SHRINK_PRESETS_SEC[this.shrinkMode] || SHRINK_PRESETS_SEC.medium);
     this.shrinkRadius = SHRINK_INITIAL_RADIUS;
     this.lastShrinkAt = Date.now();
+
+    // ---- Paramètres avancés ----
+    this.startingHP = clamp(Math.round(numOr(rawConfig.startingHP, DEFAULT_START_HP)), 30, 300);
+    this.respawnDelaySec = clamp(numOr(rawConfig.respawnDelaySec, DEFAULT_RESPAWN_DELAY_SEC), 1, 20);
+    this.respawnHpPercent = clamp(Math.round(numOr(rawConfig.respawnHpPercent, DEFAULT_RESPAWN_HP_PERCENT)), 5, 100);
+    this.attackWindowSec = clamp(numOr(rawConfig.attackWindowSec, DEFAULT_ATTACK_WINDOW_SEC), 4, 60);
+    this.turnGapSec = clamp(numOr(rawConfig.turnGapSec, DEFAULT_TURN_GAP_SEC), 0.5, 15);
+    this.moveCooldownMs = clamp(Math.round(numOr(rawConfig.moveCooldownMs, DEFAULT_MOVE_COOLDOWN_MS)), 150, 3000);
+    this.damageMultiplier = clamp(numOr(rawConfig.damageMultiplier, DEFAULT_DAMAGE_MULTIPLIER), 0.25, 3);
+    this.barrelDamage = clamp(Math.round(numOr(rawConfig.barrelDamage, DEFAULT_BARREL_DAMAGE)), 0, 100);
+    this.powerupMaxOnMap = clamp(Math.round(numOr(rawConfig.powerupMaxOnMap, DEFAULT_POWERUP_MAX_ON_MAP)), 0, 8);
+    this.weaponNoRepeat = rawConfig.weaponNoRepeat !== false && rawConfig.weaponNoRepeat !== "false";
+    this.mineVisibleToAll = rawConfig.mineVisibleToAll === true || rawConfig.mineVisibleToAll === "true";
+
     this.suddenDeath = false;
     this.suddenDeathIds = new Set();
     this.lastAttackId = null;
@@ -332,12 +413,13 @@ class Room {
     this.pendingAttacks.clear();
 
     const hillExclude = mode === "kingHill" ? HILL_CELLS.map(([x, y]) => ({ x, y })) : [];
-    this.generateMap(rawConfig.mapId, hillExclude);
+    if (rawConfig.mapId === "custom" && rawConfig.customMap) this.useCustomMap(rawConfig.customMap, hillExclude);
+    else this.generateMap(rawConfig.mapId, hillExclude);
 
     const playerList = Object.values(this.players);
     playerList.forEach((p, idx) => {
       const spawn = this.freeSpawn();
-      p.hp = START_HP; p.alive = true; p.x = spawn.x; p.y = spawn.y;
+      p.hp = this.startingHP; p.alive = true; p.x = spawn.x; p.y = spawn.y;
       p.shield = false; p.respawnAt = null; p.resistUntil = null; p.speedUntil = null;
       p.rootedUntil = null; p.slowedUntil = null;
       p.eliminations = 0; p.score = 0; p.damageDealt = 0; p.damageTaken = 0; p.timesKO = 0;
@@ -361,7 +443,7 @@ class Room {
     this.secondTimer = setInterval(() => this.secondTick(), 1000);
     this.secondTimer.unref();
 
-    this.scheduleTick(TURN_GAP_MS);
+    this.scheduleTick(this.turnGapSec * 1000);
   }
 
   scheduleTick(delayMs) {
@@ -431,12 +513,13 @@ class Room {
     if (!player.alive) return;
     if (this.teamsEnabled && attackerId) {
       const attacker = this.players[attackerId];
-      if (attacker && attacker.team && attacker.team === player.team && attacker.id !== player.id) return; // pas de tir ami
+      if (attacker && attacker.team && attacker.team === player.team && attacker.id !== player.id) return;
     }
     if (player.shield) { player.shield = false; this.pushLog(`${player.pseudo} bloque l'attaque avec son bouclier !`); return; }
-    if (player.resistUntil && Date.now() < player.resistUntil) amount = Math.round(amount * RESIST_DAMAGE_MULT);
+    amount = amount * this.damageMultiplier;
+    if (player.resistUntil && Date.now() < player.resistUntil) amount = amount * RESIST_DAMAGE_MULT;
     amount = Math.max(0, Math.round(amount));
-    player.hp = clamp(player.hp - amount, 0, START_HP);
+    player.hp = clamp(player.hp - amount, 0, this.startingHP);
     player.damageTaken += amount;
     if (attackerId) {
       const attacker = this.players[attackerId];
@@ -444,7 +527,7 @@ class Room {
     }
     if (player.hp === 0) this.onElimination(attackerId, player);
   }
-  applyHeal(player, amount) { if (player.alive) player.hp = clamp(player.hp + amount, 0, START_HP); }
+  applyHeal(player, amount) { if (player.alive) player.hp = clamp(player.hp + amount, 0, this.startingHP); }
 
   onElimination(attackerId, victim) {
     victim.alive = false;
@@ -469,7 +552,7 @@ class Room {
     }
 
     const respawns = MODES[this.mode] ? MODES[this.mode].respawns : true;
-    victim.respawnAt = respawns ? Date.now() + RESPAWN_DELAY_MS : null;
+    victim.respawnAt = respawns ? Date.now() + this.respawnDelaySec * 1000 : null;
 
     this.checkWinCondition();
   }
@@ -531,7 +614,7 @@ class Room {
         if (!inBounds(bx, by)) continue;
         extra.push({ x: bx, y: by });
         const bp = hitPlayerAt(bx, by);
-        if (bp) this.applyDamage(attackerId, bp, BARREL_DAMAGE);
+        if (bp) this.applyDamage(attackerId, bp, this.barrelDamage);
         if (this.isBarrel(bx, by)) queue.push({ x: bx, y: by });
       }
     }
@@ -542,10 +625,10 @@ class Room {
   handleMove(player, msg) {
     if (!player.alive) return;
     const now = Date.now();
-    if (player.rootedUntil && now < player.rootedUntil) return; // immobilisé par un Filet
-    let cooldown = MOVE_COOLDOWN_MS;
+    if (player.rootedUntil && now < player.rootedUntil) return;
+    let cooldown = this.moveCooldownMs;
     if (this.isMud(player.x, player.y)) cooldown *= MUD_COOLDOWN_MULT;
-    if (player.slowedUntil && now < player.slowedUntil) cooldown *= MUD_COOLDOWN_MULT; // ralenti par la Vague de givre
+    if (player.slowedUntil && now < player.slowedUntil) cooldown *= MUD_COOLDOWN_MULT;
     if (player.speedUntil && now < player.speedUntil) cooldown = Math.round(cooldown * SPEED_COOLDOWN_MULT);
     if (now - player.lastMove < cooldown) return;
 
@@ -557,7 +640,7 @@ class Room {
 
     const occupant = Object.values(this.players).find(p => p.alive && p.id !== player.id && p.x === x && p.y === y);
     if (occupant) {
-      if (!this.pushEnabled) return; // poussée désactivée : la case est infranchissable, comme un mur
+      if (!this.pushEnabled) return;
       const pushX = x + dx, pushY = y + dy;
       const pushBlocked = !inBounds(pushX, pushY) || this.isBlocked(pushX, pushY) ||
         Object.values(this.players).some(p => p.alive && p.id !== occupant.id && p.x === pushX && p.y === pushY);
@@ -581,12 +664,12 @@ class Room {
     const attack = turn.attack;
     this.turn = null;
 
-    const isDelayed = !!attack.damage && !attack.trap && !attack.instant;
+    const isDelayed = (!!attack.damage || attack.forceTelegraph) && !attack.trap && !attack.instant;
 
     if (!isDelayed) {
-      const affected = this.resolveAttackEffects(player, attack, msg, null);
+      const result = this.resolveAttackEffects(player, attack, msg, null);
       this.pushLog(`${player.pseudo} utilise ${attack.name} !`);
-      this.broadcast({ type: "attackResolved", attackId: attack.id, by: player.id, cells: affected });
+      this.broadcast({ type: "attackResolved", attackId: attack.id, by: player.id, cells: result.cells, groups: result.groups || null });
     } else {
       const cells = this.computeAttackCells(player, attack, msg);
       const delay = attack.telegraphMs || DEFAULT_TELEGRAPH_MS;
@@ -599,8 +682,8 @@ class Room {
         if (this.status !== "playing") return;
         const liveAttacker = this.players[player.id];
         if (!liveAttacker) return;
-        const affected = this.resolveAttackEffects(liveAttacker, attack, msg, cells);
-        this.broadcast({ type: "attackResolved", attackId: attack.id, by: liveAttacker.id, cells: affected });
+        const result = this.resolveAttackEffects(liveAttacker, attack, msg, cells);
+        this.broadcast({ type: "attackResolved", attackId: attack.id, by: liveAttacker.id, cells: result.cells, groups: result.groups || null });
         this.broadcast(this.publicState());
       }, delay);
       if (handle.unref) handle.unref();
@@ -608,7 +691,7 @@ class Room {
     }
 
     this.broadcast(this.publicState());
-    if (this.status === "playing") this.scheduleTick(TURN_GAP_MS);
+    if (this.status === "playing") this.scheduleTick(this.turnGapSec * 1000);
   }
 
   computeAttackCells(player, attack, msg) {
@@ -634,7 +717,6 @@ class Room {
       return cells;
     }
     if (attack.target === "line") {
-      // rayon dans les deux sens depuis la case choisie, stoppé par les murs
       const axis = msg.axis === "col" ? "col" : "row";
       const step = axis === "row" ? [1, 0] : [0, 1];
       const cells = [{ x: msg.x, y: msg.y }];
@@ -669,8 +751,13 @@ class Room {
     return [];
   }
 
+  // Retourne toujours { cells, groups }. `groups` (tableau de tableaux de cases)
+  // n'est renseigné que pour les attaques "en rafale" (staggered côté client) —
+  // il sert à afficher/jouer chaque impact un par un plutôt que tous en même temps.
   resolveAttackEffects(player, attack, msg, precomputedCells) {
     const hitPlayerAt = (x, y) => Object.values(this.players).find(p => p.alive && p.x === x && p.y === y);
+    let affected = [];
+    let groups = null;
 
     if (precomputedCells) {
       const originalCells = precomputedCells.slice();
@@ -679,10 +766,9 @@ class Room {
         if (!hitP) continue;
         if (attack.damage) this.applyDamage(player.id, hitP, attack.damage);
         if (attack.root && hitP.alive) hitP.rootedUntil = Date.now() + (attack.rootMs || 3000);
-        if (attack.slow && hitP.alive) hitP.slowedUntil = Date.now() + (attack.slowMs || 6000);
+        if (attack.slow && hitP.alive) hitP.slowedUntil = Date.now() + (attack.slowMs || 1500);
       }
 
-      // Tornade : aspire chaque joueur touché d'une case vers le centre de la zone
       if (attack.pull) {
         for (const c of originalCells) {
           const hitP = hitPlayerAt(c.x, c.y);
@@ -695,22 +781,33 @@ class Room {
         }
       }
 
+      if (attack.acidRain) {
+        const zone = this.cellsForZone(msg.x, msg.y, attack.size);
+        const drops = shuffle(zone).slice(0, Math.min(attack.drops || 10, zone.length));
+        for (const d of drops) {
+          this.hazards.push({ type: "poison", x: d.x, y: d.y, size: 1, damage: attack.dropDamage || 6, ticks: attack.dropTicks || 10, ownerId: player.id });
+        }
+        groups = drops.map(d => [d]);
+      }
+
       const extra = this.triggerBarrelChain(player.id, originalCells);
-      const affected = originalCells.concat(extra);
+      affected = originalCells.concat(extra);
 
       if (attack.poison) {
         this.hazards.push({ type: "poison", x: msg.x, y: msg.y, size: attack.size, damage: attack.damage, ticks: attack.ticks, ownerId: player.id });
+      }
+      if (attack.slow) {
+        this.hazards.push({ type: "frost", x: msg.x, y: msg.y, size: attack.size, damage: Math.round((attack.damage || 0) / 2), ticks: attack.traceTicks || 6, slowMs: attack.slowMs || 1500, ownerId: player.id });
       }
       if (attack.target === "direction" && attack.moveSelf) {
         const dest = originalCells[originalCells.length - 1] || { x: player.x, y: player.y };
         const occupied = Object.values(this.players).some(p => p.alive && p.id !== player.id && p.x === dest.x && p.y === dest.y);
         if (!occupied && !this.isBlocked(dest.x, dest.y)) { player.x = dest.x; player.y = dest.y; }
       }
-      return affected;
+      return { cells: affected, groups };
     }
 
-    // ---- Effets instantanés : piège, téléportation, soin, bouclier, tir de précision, laser ----
-    let affected = [];
+    // ---- Effets instantanés : piège, téléportation, soin, bouclier, tirs directs, rafales ----
     if (attack.target === "cell" && attack.trap) {
       if (inBounds(msg.x, msg.y) && !this.isBlocked(msg.x, msg.y)) { this.hazards.push({ type: "mine", x: msg.x, y: msg.y, damage: attack.damage, ownerId: player.id }); affected = [{ x: msg.x, y: msg.y }]; }
     } else if (attack.target === "cell" && attack.teleport) {
@@ -725,29 +822,52 @@ class Room {
         affected = [{ x: msg.x, y: msg.y }];
         const hitP = hitPlayerAt(msg.x, msg.y);
         if (hitP) this.applyDamage(player.id, hitP, attack.damage);
-        const extra = this.triggerBarrelChain(player.id, [{ x: msg.x, y: msg.y }]);
-        affected = affected.concat(extra);
+        affected = affected.concat(this.triggerBarrelChain(player.id, [{ x: msg.x, y: msg.y }]));
       }
     } else if (attack.target === "line" && attack.instant) {
       const cells = this.computeAttackCells(player, attack, msg);
       affected = cells.slice();
       for (const c of affected) { const hitP = hitPlayerAt(c.x, c.y); if (hitP) this.applyDamage(player.id, hitP, attack.damage); }
-      const extra = this.triggerBarrelChain(player.id, affected);
-      affected = affected.concat(extra);
+      affected = affected.concat(this.triggerBarrelChain(player.id, affected));
     } else if (attack.target === "direction" && attack.instant) {
       const cells = this.computeAttackCells(player, attack, msg);
       affected = cells.slice();
       for (const c of affected) { const hitP = hitPlayerAt(c.x, c.y); if (hitP) this.applyDamage(player.id, hitP, attack.damage); }
-      const extra = this.triggerBarrelChain(player.id, affected);
-      affected = affected.concat(extra);
+      affected = affected.concat(this.triggerBarrelChain(player.id, affected));
       if (attack.moveSelf) {
         const dest = cells[cells.length - 1] || { x: player.x, y: player.y };
         const occupied = Object.values(this.players).some(p => p.alive && p.id !== player.id && p.x === dest.x && p.y === dest.y);
         if (!occupied && !this.isBlocked(dest.x, dest.y)) { player.x = dest.x; player.y = dest.y; }
       }
+    } else if (attack.target === "self" && attack.instant && !attack.shield) {
+      const cells = this.computeAttackCells(player, attack, msg);
+      affected = cells.slice();
+      for (const c of affected) { const hitP = hitPlayerAt(c.x, c.y); if (hitP) this.applyDamage(player.id, hitP, attack.damage); }
+      affected = affected.concat(this.triggerBarrelChain(player.id, affected));
     } else if (attack.target === "self" && attack.shield) {
       player.shield = true;
       affected = [{ x: player.x, y: player.y }];
+    } else if (attack.target === "zone" && attack.random && attack.instant && attack.subSize) {
+      // Chute de napalme : plusieurs mini-explosions 3x3 en rafale dans la grande zone
+      const zone = this.cellsForZone(msg.x, msg.y, attack.size);
+      let all = [];
+      const grp = [];
+      for (let i = 0; i < (attack.hits || 1); i++) {
+        const center = zone[randInt(zone.length)];
+        const subCells = this.cellsForZone(center.x, center.y, attack.subSize);
+        for (const c of subCells) { const hitP = hitPlayerAt(c.x, c.y); if (hitP) this.applyDamage(player.id, hitP, attack.damage); }
+        all = all.concat(subCells);
+        grp.push(subCells);
+      }
+      affected = all.concat(this.triggerBarrelChain(player.id, all));
+      groups = grp;
+    } else if (attack.target === "zone" && attack.random && attack.instant) {
+      const zone = this.cellsForZone(msg.x, msg.y, attack.size);
+      const picks = [];
+      for (let i = 0; i < (attack.hits || 1); i++) picks.push(zone[randInt(zone.length)]);
+      for (const c of picks) { const hitP = hitPlayerAt(c.x, c.y); if (hitP) this.applyDamage(player.id, hitP, attack.damage); }
+      affected = picks.concat(this.triggerBarrelChain(player.id, picks));
+      groups = picks.map(c => [c]);
     } else if (attack.target === "ally") {
       const targetId = msg.targetId || player.id;
       const target = this.players[targetId];
@@ -756,7 +876,7 @@ class Room {
         if (target.id === player.id || dist <= 2) { this.applyHeal(target, attack.heal); affected = [{ x: target.x, y: target.y }]; }
       }
     }
-    return affected;
+    return { cells: affected, groups };
   }
 
   hillTick() {
@@ -779,16 +899,19 @@ class Room {
     for (const p of Object.values(this.players)) {
       if (!p.alive && p.respawnAt && Date.now() >= p.respawnAt) {
         const spawn = this.freeSpawn();
-        p.alive = true; p.hp = Math.round(START_HP / 2); p.x = spawn.x; p.y = spawn.y; p.respawnAt = null;
+        p.alive = true; p.hp = Math.round(this.startingHP * (this.respawnHpPercent / 100)); p.x = spawn.x; p.y = spawn.y; p.respawnAt = null;
         this.pushLog(`${p.pseudo} revient dans l'arène.`);
       }
     }
 
     this.hazards = this.hazards.filter(h => {
-      if (h.type !== "poison") return true;
+      if (h.type !== "poison" && h.type !== "frost") return true;
       const cells = this.cellsForZone(h.x, h.y, h.size);
       for (const p of Object.values(this.players)) {
-        if (p.alive && cells.some(c => c.x === p.x && c.y === p.y)) this.applyDamage(h.ownerId, p, h.damage);
+        if (p.alive && cells.some(c => c.x === p.x && c.y === p.y)) {
+          this.applyDamage(h.ownerId, p, h.damage);
+          if (h.type === "frost" && p.alive) p.slowedUntil = Date.now() + (h.slowMs || 1500);
+        }
       }
       h.ticks -= 1;
       return h.ticks > 0;
@@ -806,12 +929,12 @@ class Room {
       for (const p of Object.values(this.players)) {
         if (p.alive && this.isVoid(p.x, p.y)) this.applyDamage(null, p, SHRINK_DAMAGE_PER_SEC);
       }
-      if (this.status !== "playing") return; // la zone peut avoir achevé la partie
+      if (this.status !== "playing") return;
     }
 
     if (this.powerupsEnabled) {
       const intervalMs = this.powerupIntervalSec * 1000;
-      if (Date.now() - this.lastPowerupSpawn >= intervalMs && this.powerups.length < MAX_POWERUPS_ON_MAP) {
+      if (Date.now() - this.lastPowerupSpawn >= intervalMs && this.powerups.length < this.powerupMaxOnMap) {
         const spot = this.freeSpawn();
         const type = POWERUP_TYPES[randInt(POWERUP_TYPES.length)];
         this.powerups.push({ id: crypto.randomUUID(), x: spot.x, y: spot.y, type });
@@ -822,7 +945,6 @@ class Room {
     this.broadcast(this.publicState());
   }
 
-  // ---- Fin de Chrono : gagnant, égalité -> mort subite ----
   resolveChronoEnd() {
     const list = Object.values(this.players);
 
@@ -858,9 +980,6 @@ class Room {
     this.endGame([], "chrono");
   }
 
-  // Pioche le prochain joueur dans un "sac" mélangé, sans le remettre dedans —
-  // ainsi tout le monde joue avant qu'un même joueur puisse rejouer. Le sac est
-  // reconstitué (et remélangé) avec les joueurs vivants du moment dès qu'il est vide.
   pickNextAttacker() {
     while (this.turnQueue.length) {
       const id = this.turnQueue.shift();
@@ -869,13 +988,22 @@ class Room {
     }
     const alive = Object.values(this.players).filter(p => p.alive).map(p => p.id);
     if (alive.length === 0) return null;
-    for (let i = alive.length - 1; i > 0; i--) {
-      const j = randInt(i + 1);
-      [alive[i], alive[j]] = [alive[j], alive[i]];
-    }
-    this.turnQueue = alive;
+    this.turnQueue = shuffle(alive);
     const id = this.turnQueue.shift();
     return this.players[id] || null;
+  }
+
+  // Tirage pondéré : la plupart des armes ont un poids de 1 (probabilité normale),
+  // les armes rarissimes (napalm, pluie acide) ont un poids très inférieur à 1.
+  pickWeightedAttack() {
+    const total = ATTACKS.reduce((s, a) => s + (a.weight !== undefined ? a.weight : 1), 0);
+    let r = Math.random() * total;
+    for (const a of ATTACKS) {
+      const w = a.weight !== undefined ? a.weight : 1;
+      if (r < w) return a;
+      r -= w;
+    }
+    return ATTACKS[ATTACKS.length - 1];
   }
 
   tick() {
@@ -885,7 +1013,7 @@ class Room {
     if (this.mode === "chrono" && this.chronoEndAt && now >= this.chronoEndAt && !this.suddenDeath) {
       this.resolveChronoEnd();
       if (this.status !== "playing") return;
-      this.scheduleTick(TURN_GAP_MS);
+      this.scheduleTick(this.turnGapSec * 1000);
       return;
     }
 
@@ -894,23 +1022,26 @@ class Room {
       this.pushLog(`${p ? p.pseudo : "Le joueur"} n'a pas utilisé son arme à temps.`);
       this.turn = null;
       this.broadcast(this.publicState());
-      this.scheduleTick(TURN_GAP_MS);
+      this.scheduleTick(this.turnGapSec * 1000);
       return;
     }
 
     if (!this.turn) {
       const chosen = this.pickNextAttacker();
       if (!chosen) { this.scheduleTick(1000); return; }
-      let attack = ATTACKS[randInt(ATTACKS.length)];
-      if (ATTACKS.length > 1) {
+      let attack = this.pickWeightedAttack();
+      if (this.weaponNoRepeat && ATTACKS.length > 1) {
         let guard = 0;
-        while (attack.id === this.lastAttackId && guard < 10) { attack = ATTACKS[randInt(ATTACKS.length)]; guard++; }
+        while (attack.id === this.lastAttackId && guard < 10) { attack = this.pickWeightedAttack(); guard++; }
       }
       this.lastAttackId = attack.id;
-      this.turn = { playerId: chosen.id, attack, deadline: Date.now() + ATTACK_WINDOW_MS };
+      const deadline = Date.now() + this.attackWindowSec * 1000;
+      this.turn = { playerId: chosen.id, attack, deadline };
+      // Charge : un peu plus vif tant qu'on l'a en main, pour repositionner son élan.
+      if (attack.id === "charge") chosen.speedUntil = Math.max(chosen.speedUntil || 0, deadline);
       this.pushLog(`${chosen.pseudo} reçoit : ${attack.name} !`);
       this.broadcast(this.publicState());
-      this.scheduleTick(ATTACK_WINDOW_MS + 200);
+      this.scheduleTick(this.attackWindowSec * 1000 + 200);
     } else {
       this.scheduleTick(1000);
     }
@@ -975,7 +1106,7 @@ const server = http.createServer((req, res) => {
           code: room.code,
           hostPseudo: (room.players[room.hostId] && room.players[room.hostId].pseudo) || "?",
           players: count,
-          maxPlayers: MAX_PLAYERS,
+          maxPlayers: room.maxPlayers,
           status: room.status,
         });
       }
@@ -1014,7 +1145,7 @@ server.on("upgrade", (req, socket, head) => {
 
     const room = getOrCreateRoom(code);
     const player = room.addPlayer(ws, pseudo, clientId);
-    if (!player) { ws.send(JSON.stringify({ type: "error", message: "Partie pleine — 6 joueurs max." })); ws.close(1008, "full"); return; }
+    if (!player) { ws.send(JSON.stringify({ type: "error", message: "Partie pleine." })); ws.close(1008, "full"); return; }
 
     ws.send(JSON.stringify({ type: "welcome", playerId: player.id, code: room.code, modes: MODES, maps: MAPS }));
     room.pushLog(`${pseudo} a rejoint la partie.`);
@@ -1037,6 +1168,13 @@ server.on("upgrade", (req, socket, head) => {
       } else if (msg.type === "setPublic" && player.id === room.hostId) {
         room.isPublic = !!msg.value;
         room.broadcast(room.publicState());
+      } else if (msg.type === "setMaxPlayers" && player.id === room.hostId && room.status === "lobby") {
+        room.maxPlayers = clamp(parseInt(msg.value) || MAX_PLAYERS_HARD_CAP, 2, MAX_PLAYERS_HARD_CAP);
+        room.broadcast(room.publicState());
+      } else if (msg.type === "kickPlayer" && player.id === room.hostId && msg.targetId !== room.hostId) {
+        room.kickPlayer(msg.targetId);
+      } else if (msg.type === "transferHost" && player.id === room.hostId && msg.targetId !== room.hostId) {
+        room.transferHost(msg.targetId);
       } else if (msg.type === "leave") {
         room.removePlayerFully(player.id);
         room.broadcast(room.publicState());
@@ -1056,4 +1194,4 @@ if (require.main === module) {
   server.listen(PORT, () => console.log(`CapNaval backend en écoute sur le port ${PORT}`));
 }
 
-module.exports = { Room, MODES, MAPS, ATTACKS, GRID_SIZE, RECONNECT_GRACE_MS };
+module.exports = { Room, MODES, MAPS, ATTACKS, GRID_SIZE, RECONNECT_GRACE_MS, MAX_PLAYERS_HARD_CAP };
