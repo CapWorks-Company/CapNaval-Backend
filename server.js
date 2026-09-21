@@ -27,6 +27,7 @@ const BOT_DIFFICULTIES = ["easy", "medium", "hard"];
 const BOT_DODGE_CHANCE = { easy: 0.15, medium: 0.5, hard: 1 };
 const BOT_ATTACK_DELAY_MS = { easy: [900, 2400], medium: [700, 1900], hard: [250, 700] };
 const BOT_START_GRACE_MS = 3200; // ne bouge pas tant que le décompte 3-2-1-GO joue côté client
+const BOT_RANDOM_MOVE_CHANCE = 0.45; // en dehors de toute fuite : bouge au hasard, ou reste immobile
 const BOT_FLEE_ATTACKS = new Set(["charge", "shockwave"]); // attaques de mêlée à fuir
 
 // ---- Valeurs par défaut des paramètres réglables par l'hôte ----
@@ -52,7 +53,7 @@ const ATTACKS = [
   { id: "nuke",         name: "Bombe nucléaire",   desc: "Rase toute la carte, instantané — secrète, code requis", target: "self", damage: 999, instant: true, nuke: true, weight: 0, secret: true },
   { id: "snipe",        name: "Tir de précision",  desc: "Dégâts élevés sur une case, instantané",       target: "cell", damage: 35, instant: true },
   { id: "laser",        name: "Rayon laser",       desc: "Frappe une ligne entière, instantané",         target: "line", damage: 16, instant: true },
-  { id: "chainLightning", name: "Chaîne d'éclairs", desc: "Frappe une case puis rebondit sur les joueurs les plus proches, instantané", target: "cell", damage: 18, chain: true, chainHops: 3, chainFalloff: 0.75, instant: true },
+  { id: "chainLightning", name: "Chaîne d'éclairs", desc: "Frappe une case (ou un joueur) : l'éclair s'étend en zone puis rebondit sur les joueurs proches, instantané", target: "cell", damage: 18, chain: true, chainHops: 3, chainFalloff: 0.75, chainSplashRadius: 1, instant: true },
   { id: "shockwave",    name: "Onde de choc",      desc: "Frappe toutes les cases autour de toi, instantané", target: "self", damage: 18, instant: true },
   { id: "earthquake",   name: "Séisme",            desc: "Secoue toute la carte : petits dégâts et déplace tout le monde d'une case au hasard, instantané", target: "self", damage: 6, earthquake: true, instant: true },
   { id: "gunline",      name: "Rafale",            desc: "Mitraille une ligne, stoppée par les murs",   target: "line", damage: 12, telegraphMs: 1300 },
@@ -155,7 +156,7 @@ class Room {
     this.bossId = null;
     this.bossHpMultiplier = 3;
     this.flags = [];
-    this.fillWithBots = false;
+    this.fillBotCount = 0;
     this.fillBotDifficulty = "medium";
     this.activeTelegraphs = [];
     this.matchStartedAt = 0;
@@ -223,7 +224,7 @@ class Room {
       startingHP: this.startingHP,
       bossHpMultiplier: this.bossHpMultiplier,
       flags: this.flags,
-      fillWithBots: this.fillWithBots,
+      fillBotCount: this.fillBotCount,
       fillBotDifficulty: this.fillBotDifficulty,
       mode: this.mode,
       modeLabel: this.mode ? MODES[this.mode].label : null,
@@ -318,6 +319,20 @@ class Room {
   }
 
   // ---- Joueurs / reconnexion ----
+  // Choisit un nouvel hôte parmi les VRAIS joueurs seulement (jamais un bot) quand
+  // l'hôte quitte. S'il ne reste plus aucun joueur réel, la partie s'arrête et tous
+  // les bots disparaissent : les bots ne comptent jamais comme membres du salon.
+  reassignHostOrClose(leavingId) {
+    if (this.hostId !== leavingId) return;
+    const successor = Object.values(this.players).find(p => !p.isBot);
+    if (successor) { this.hostId = successor.id; return; }
+    this.hostId = null;
+    for (const id of Object.keys(this.players)) {
+      if (this.players[id].isBot) delete this.players[id];
+    }
+    if (this.status === "playing") this.abortToLobby();
+  }
+
   // Évite les doublons de pseudo dans une même partie : pseudo, puis pseudo_1, pseudo_2...
   uniquePseudo(base, excludeId) {
     const taken = Object.values(this.players).filter(p => p.id !== excludeId).map(p => p.pseudo);
@@ -389,22 +404,23 @@ class Room {
   // toujours : un bot de remplissage est retiré dès qu'un joueur en a besoin.
   syncBotFill() {
     if (this.status !== "lobby") return;
-    if (!this.fillWithBots) {
-      for (const id of Object.keys(this.players)) {
-        if (this.players[id].isFillBot) delete this.players[id];
-      }
-      return;
-    }
     let fillBotIds = Object.values(this.players).filter(p => p.isFillBot).map(p => p.id);
     const realCount = Object.keys(this.players).length - fillBotIds.length;
-    while (realCount + fillBotIds.length > this.maxPlayers && fillBotIds.length > 0) {
+    if (realCount === 0) {
+      // une salle ne contient jamais que des bots : sans vrai joueur, aucun bot.
+      for (const id of fillBotIds) delete this.players[id];
+      return;
+    }
+    const target = Math.max(0, Math.min(this.fillBotCount || 0, this.maxPlayers - realCount));
+    while (fillBotIds.length > target) {
       const id = fillBotIds.pop();
       delete this.players[id];
     }
     let n = 1;
-    while (Object.keys(this.players).length < this.maxPlayers) {
+    while (fillBotIds.length < target) {
       const bot = this.addBotPlayer(`Bot ${n}`, this.fillBotDifficulty);
       bot.isFillBot = true;
+      fillBotIds.push(bot.id);
       n++;
     }
   }
@@ -426,7 +442,7 @@ class Room {
     } else {
       this.pushLog(`${p.pseudo} a quitté la partie.`);
       delete this.players[id];
-      if (this.hostId === id) this.hostId = Object.keys(this.players)[0] || null;
+      this.reassignHostOrClose(id);
       this.syncBotFill();
     }
   }
@@ -436,7 +452,7 @@ class Room {
     if (!p) return;
     this.pushLog(`${p.pseudo} a quitté la partie.`);
     delete this.players[id];
-    if (this.hostId === id) this.hostId = Object.keys(this.players)[0] || null;
+    this.reassignHostOrClose(id);
     if (this.status === "playing") this.checkWinCondition();
     this.syncBotFill();
   }
@@ -451,7 +467,7 @@ class Room {
     }
     this.pushLog(`${p.pseudo} a été exclu par l'hôte.`);
     delete this.players[targetId];
-    if (this.hostId === targetId) this.hostId = Object.keys(this.players)[0] || null;
+    this.reassignHostOrClose(targetId);
     if (this.status === "playing") this.checkWinCondition();
     this.syncBotFill();
     this.broadcast(this.publicState());
@@ -471,7 +487,7 @@ class Room {
       if (!p.connected && p.disconnectedAt && Date.now() - p.disconnectedAt > RECONNECT_GRACE_MS) {
         this.pushLog(`${p.pseudo} a été retiré — déconnecté trop longtemps.`);
         delete this.players[id];
-        if (this.hostId === id) this.hostId = Object.keys(this.players)[0] || null;
+        this.reassignHostOrClose(id);
       }
     }
   }
@@ -500,7 +516,7 @@ class Room {
   start(mode, rawConfig) {
     if (this.status === "playing") return;
     for (const [id, p] of Object.entries(this.players)) {
-      if (!p.connected) { delete this.players[id]; if (this.hostId === id) this.hostId = Object.keys(this.players)[0] || null; }
+      if (!p.connected) { delete this.players[id]; this.reassignHostOrClose(id); }
     }
     if (Object.keys(this.players).length < 1) return;
     if (!MODES[mode]) mode = "koHunt";
@@ -930,6 +946,17 @@ class Room {
         player.forcedNextAttackId = valid.id;
         this.pushLog(`${player.pseudo} a activé un code secret… 👀`);
       }
+    } else if (msg.code === "buff" && ["heal", "shield", "speed"].includes(msg.buff) && player.alive) {
+      if (msg.buff === "heal") {
+        this.applyHeal(player, 9999); // remonte au maximum, applyHeal plafonne déjà
+      } else if (msg.buff === "shield") {
+        player.shield = true;
+      } else if (msg.buff === "speed") {
+        const durMs = (this.buffDurationSec || 10) * 1000;
+        player.speedUntil = Math.max(player.speedUntil || 0, Date.now() + durMs);
+      }
+      this.pushLog(`${player.pseudo} a activé un code secret… 👀`);
+      this.broadcast(this.publicState()); // effet immédiat, contrairement aux deux codes ci-dessus
     }
   }
 
@@ -1036,7 +1063,8 @@ class Room {
     }
     if (attack.target === "direction") {
       const dirs = { up: [0, -1], down: [0, 1], left: [-1, 0], right: [1, 0] };
-      const d = dirs[msg.dir] || [0, 0];
+      const d = dirs[msg.dir];
+      if (!d) return []; // direction absente/invalide : aucun effet, ne doit jamais viser le lanceur
       let cx = player.x, cy = player.y;
       const cells = [];
       const maxSteps = attack.distance || this.gridSize;
@@ -1121,19 +1149,31 @@ class Room {
         affected = [origin, { x: msg.x, y: msg.y }];
       }
     } else if (attack.target === "cell" && attack.instant && attack.chain) {
+      // L'éclair frappe toujours la case choisie (zone d'effet autour), même si
+      // personne ne s'y trouve exactement, puis rebondit vers le joueur non
+      // touché le plus proche, avec la même zone d'effet à chaque impact.
       const hitIds = new Set([player.id]); // la chaîne ne rebondit jamais sur son lanceur
-      let cx = msg.x, cy = msg.y, dmg = attack.damage, hops = 0;
+      const splashRadius = attack.chainSplashRadius || 0;
+      const hitPlayersNear = (x, y) => Object.values(this.players).filter(p =>
+        p.alive && !hitIds.has(p.id) && Math.max(Math.abs(p.x - x), Math.abs(p.y - y)) <= splashRadius);
+
+      let dmg = attack.damage, hops = 0;
       const maxHops = attack.chainHops || 3;
-      const chainCells = [];
+      const chainCells = [{ x: msg.x, y: msg.y }]; // l'impact initial est toujours affiché
+      let cx = msg.x, cy = msg.y;
+
       while (hops <= maxHops) {
-        const hitP = hops === 0 ? hitPlayerAt(cx, cy) : this.nearestAliveExcluding(cx, cy, hitIds);
-        if (!hitP) break;
-        this.applyDamage(player.id, hitP, Math.round(dmg));
-        hitIds.add(hitP.id);
-        chainCells.push({ x: hitP.x, y: hitP.y });
-        cx = hitP.x; cy = hitP.y;
+        for (const p of hitPlayersNear(cx, cy)) {
+          this.applyDamage(player.id, p, Math.round(dmg));
+          hitIds.add(p.id);
+          chainCells.push({ x: p.x, y: p.y });
+        }
         dmg *= (attack.chainFalloff !== undefined ? attack.chainFalloff : 0.75);
         hops++;
+        if (hops > maxHops) break;
+        const next = this.nearestAliveExcluding(cx, cy, hitIds);
+        if (!next) break;
+        cx = next.x; cy = next.y;
       }
       affected = chainCells.concat(this.triggerBarrelChain(player.id, chainCells));
       groups = chainCells.map(c => [c]);
@@ -1255,13 +1295,13 @@ class Room {
       const fled = rooted ? false : this.botTryFlee(bot);
 
       if (!fled && !rooted) {
-        const target = this.nearestAliveExcluding(bot.x, bot.y, new Set([bot.id]));
-        if (target) {
-          const dx = Math.sign(target.x - bot.x), dy = Math.sign(target.y - bot.y);
-          const moves = [];
-          if (dx !== 0) moves.push({ x: bot.x + dx, y: bot.y });
-          if (dy !== 0) moves.push({ x: bot.x, y: bot.y + dy });
-          for (const m of shuffle(moves)) this.handleMove(bot, m);
+        // Comportement neutre : ne traque jamais un joueur. Bouge au hasard une
+        // fois sur deux environ, ou reste simplement immobile.
+        if (Math.random() < BOT_RANDOM_MOVE_CHANCE) {
+          for (const [dx, dy] of shuffle([[1, 0], [-1, 0], [0, 1], [0, -1]])) {
+            const m = { x: bot.x + dx, y: bot.y + dy };
+            if (this.inBounds(m.x, m.y) && !this.isBlocked(m.x, m.y)) { this.handleMove(bot, m); break; }
+          }
         }
       }
 
@@ -1675,7 +1715,7 @@ server.on("upgrade", (req, socket, head) => {
         room.syncBotFill();
         room.broadcast(room.publicState());
       } else if (msg.type === "setFillBots" && player.id === room.hostId && room.status === "lobby") {
-        room.fillWithBots = !!msg.enabled;
+        room.fillBotCount = clamp(parseInt(msg.count) || 0, 0, MAX_PLAYERS_HARD_CAP - 1);
         if (BOT_DIFFICULTIES.includes(msg.difficulty)) room.fillBotDifficulty = msg.difficulty;
         room.syncBotFill();
         room.broadcast(room.publicState());
