@@ -17,6 +17,25 @@ const SHRINK_MIN_RADIUS = 1;
 const SHRINK_DAMAGE_PER_SEC = 6;
 const HILL_TICK_MS = 2000;
 const DEFAULT_GRID_SIZE = 12;
+const BREAKABLE_WALL_HP = 30;
+const BREAKABLE_WALL_DAMAGE_PER_HIT = 15;
+const HEAL_TILE_PER_SEC = 6;
+const TELEPORT_TILE_COOLDOWN_MS = 5000;
+const LIGHTNING_ROD_RADIUS = 1;
+const LIGHTNING_ROD_BONUS_DAMAGE = 20;
+
+const MAP_MODIFIERS = {
+  meteorRain: { label: "Pluie de météorites", desc: "Des météorites tombent du ciel de temps en temps.", icon: "☄️" },
+  storm:      { label: "Orage",               desc: "La foudre frappe un joueur au hasard régulièrement.", icon: "🌩️" },
+  earthquakeMod: { label: "Séisme",           desc: "La terre tremble souvent, petits dégâts à tous.",    icon: "🌍" },
+  acidRainMod:   { label: "Pluie acide",      desc: "De l'acide tombe en continu, mais rarement.",        icon: "🧪" },
+  cemetery:      { label: "Cimetière",        desc: "Des ombres sans nom surgissent et explosent au contact.", icon: "🧟" },
+};
+const MAP_MODIFIER_INTERVAL_SEC = {
+  meteorRain: [8, 15], storm: [10, 18], earthquakeMod: [15, 25], acidRainMod: [22, 34], cemetery: [12, 22],
+};
+const ZOMBIE_MAX_ALIVE = 3;
+const ZOMBIE_EXPLOSION_DAMAGE = 22;
 const DEFAULT_TELEGRAPH_MS = 1300;
 const NUKE_RESOLVE_DELAY_MS = 2000; // dégâts appliqués juste au moment de la vraie explosion (après le faux départ), côté client
 const DEFAULT_POWERUP_INTERVAL_SEC = 14;
@@ -28,6 +47,11 @@ const BOT_DODGE_CHANCE = { easy: 0.15, medium: 0.5, hard: 1 };
 const BOT_ATTACK_DELAY_MS = { easy: [900, 2400], medium: [700, 1900], hard: [250, 700] };
 const BOT_START_GRACE_MS = 3200; // ne bouge pas tant que le décompte 3-2-1-GO joue côté client
 const BOT_RANDOM_MOVE_CHANCE = 0.45; // en dehors de toute fuite : bouge au hasard, ou reste immobile
+const BOT_NAMES = [
+  "Capitaine Rouille", "Amiral Patate", "Moussaillon Fou", "Barbe-Jus", "Grand Timonier",
+  "Sardine Enragée", "Pieuvre Grognon", "Mousse Salée", "Vieux Loup", "Pirate du Dimanche",
+  "Krill Tueur", "Boussole Cassée", "Second Couteau", "Marin d'Eau Douce", "Tempête de Poche",
+];
 const BOT_FLEE_ATTACKS = new Set(["charge", "shockwave"]); // attaques de mêlée à fuir
 
 // ---- Valeurs par défaut des paramètres réglables par l'hôte ----
@@ -102,6 +126,8 @@ const MAPS = {
   ruins:   { label: "Ruines",         desc: "Des murs pour se mettre à couvert.",                walls: 14, barrels: 4,  mud: 0 },
   swamp:   { label: "Marécage",       desc: "Des flaques de boue ralentissent les déplacements.",walls: 6,  barrels: 2,  mud: 12 },
   arsenal: { label: "Arsenal",        desc: "Beaucoup de tonneaux explosifs, réaction en chaîne.",walls: 8,  barrels: 14, mud: 0 },
+  labo:    { label: "Labo",           desc: "Paratonnerres, téléporteurs et zones de soin.",     walls: 6,  barrels: 0,  mud: 0, teleport: 4, heal: 2, lightningRod: 3 },
+  jardin:  { label: "Jardin",         desc: "Buissons où se cacher, et murs cassables.",         walls: 4,  barrels: 0,  mud: 0, bush: 8, breakable: 8 },
   custom:  { label: "Personnalisé",   desc: "Ta carte, conçue et enregistrée par toi.",          walls: 0,  barrels: 0,  mud: 0 },
 };
 
@@ -128,7 +154,7 @@ class Room {
     this.players = {};
     this.hazards = [];
     this.powerups = [];
-    this.obstacles = { walls: [], barrels: [], mud: [] };
+    this.obstacles = { walls: [], barrels: [], mud: [], heal: [], teleport: [], breakable: [], lightningRod: [], bush: [] };
     this.mapId = "open";
     this.gridSize = DEFAULT_GRID_SIZE;
     this.passiveRegenPerSec = 0;
@@ -160,6 +186,9 @@ class Room {
     this.fillBotDifficulty = "medium";
     this.activeTelegraphs = [];
     this.matchStartedAt = 0;
+    this.mapModifiers = [];
+    this.modifierNextAt = {};
+    this.zombies = [];
     this.turnQueue = [];
     this.pendingAttacks = new Set();
 
@@ -173,6 +202,8 @@ class Room {
     this.damageMultiplier = DEFAULT_DAMAGE_MULTIPLIER;
     this.barrelDamage = DEFAULT_BARREL_DAMAGE;
     this.weaponNoRepeat = true;
+    this.hideAttackFromOthers = true;
+    this.twoWeaponHand = false;
     this.mineVisibleToAll = false;
     this.attackWeightOverrides = {}; // { attackId: multiplicateur } — taux de tirage par attaque
     this.telegraphMultiplier = 1;    // vitesse du clignotement d'esquive (plus bas = plus dur à esquiver)
@@ -192,6 +223,21 @@ class Room {
     const data = JSON.stringify(msg);
     for (const p of Object.values(this.players)) {
       if (p.ws && p.ws.readyState === 1) p.ws.send(data);
+    }
+  }
+
+  // Diffuse l'état public, en cachant l'arme du tour en cours aux autres joueurs
+  // si l'option est active (activée par défaut) — chacun ne voit que sa propre arme.
+  broadcastState() {
+    const base = this.publicState();
+    if (!this.hideAttackFromOthers || !base.turn) { this.broadcast(base); return; }
+    const activeId = base.turn.playerId;
+    const hidden = { ...base, turn: { playerId: base.turn.playerId, attackId: null, attackName: null, altAttackId: null, altAttackName: null, deadline: base.turn.deadline } };
+    const fullJson = JSON.stringify(base);
+    const hiddenJson = JSON.stringify(hidden);
+    for (const p of Object.values(this.players)) {
+      if (!p.ws || p.ws.readyState !== 1) continue;
+      p.ws.send(p.id === activeId ? fullJson : hiddenJson);
     }
   }
 
@@ -215,6 +261,8 @@ class Room {
         playerId: this.turn.playerId,
         attackId: this.turn.attack.id,
         attackName: this.turn.attack.name,
+        altAttackId: this.turn.altAttack ? this.turn.altAttack.id : null,
+        altAttackName: this.turn.altAttack ? this.turn.altAttack.name : null,
         deadline: this.turn.deadline,
       } : null,
       gridSize: this.gridSize,
@@ -224,12 +272,37 @@ class Room {
       startingHP: this.startingHP,
       bossHpMultiplier: this.bossHpMultiplier,
       flags: this.flags,
+      mapModifiers: this.mapModifiers,
+      zombies: this.zombies,
       fillBotCount: this.fillBotCount,
       fillBotDifficulty: this.fillBotDifficulty,
       mode: this.mode,
       modeLabel: this.mode ? MODES[this.mode].label : null,
       config: this.config,
+      roomConfig: {
+        powerupsEnabled: this.powerupsEnabled,
+        powerupIntervalSec: this.powerupIntervalSec,
+        shrinkEnabled: this.shrinkEnabled,
+        shrinkMode: this.shrinkMode,
+        shrinkIntervalSec: this.shrinkIntervalSec,
+        respawnDelaySec: this.respawnDelaySec,
+        respawnHpPercent: this.respawnHpPercent,
+        attackWindowSec: this.attackWindowSec,
+        turnGapSec: this.turnGapSec,
+        damageMultiplier: this.damageMultiplier,
+        barrelDamage: this.barrelDamage,
+        powerupMaxOnMap: this.powerupMaxOnMap,
+        weaponNoRepeat: this.weaponNoRepeat,
+        hideAttackFromOthers: this.hideAttackFromOthers,
+        twoWeaponHand: this.twoWeaponHand,
+        telegraphMultiplier: this.telegraphMultiplier,
+        buffDurationSec: this.buffDurationSec,
+        spawnProtectionSec: this.spawnProtectionSec,
+        passiveRegenPerSec: this.passiveRegenPerSec,
+        attackWeightOverrides: this.attackWeightOverrides,
+      },
       chronoEndAt: this.chronoEndAt,
+      matchStartedAt: this.matchStartedAt,
       suddenDeath: this.suddenDeath,
       hillCells: this.hillCells().map(([x, y]) => ({ x, y })),
       winner: this.winner,
@@ -244,7 +317,32 @@ class Room {
   isWall(x, y) { return this.obstacles.walls.some(w => w.x === x && w.y === y); }
   isBarrel(x, y) { return this.obstacles.barrels.find(b => b.x === x && b.y === y) || null; }
   isMud(x, y) { return this.obstacles.mud.some(m => m.x === x && m.y === y); }
-  isBlocked(x, y) { return this.isWall(x, y) || !!this.isBarrel(x, y); }
+  isBreakable(x, y) { return (this.obstacles.breakable || []).find(b => b.x === x && b.y === y) || null; }
+  isHeal(x, y) { return (this.obstacles.heal || []).some(h => h.x === x && h.y === y); }
+  isTeleport(x, y) { return (this.obstacles.teleport || []).some(t => t.x === x && t.y === y); }
+  isBush(x, y) { return (this.obstacles.bush || []).some(b => b.x === x && b.y === y); }
+  isBlocked(x, y) { return this.isWall(x, y) || !!this.isBarrel(x, y) || !!this.isBreakable(x, y); }
+
+  // ---- Prise en charge des joueurs de plus d'une case (le Boss occupe une zone 2x2) ----
+  // p.x,p.y désigne toujours le coin haut-gauche de son empreinte.
+  playerCells(p) {
+    const s = p.size || 1;
+    if (s <= 1) return [{ x: p.x, y: p.y }];
+    const cells = [];
+    for (let dx = 0; dx < s; dx++) for (let dy = 0; dy < s; dy++) cells.push({ x: p.x + dx, y: p.y + dy });
+    return cells;
+  }
+  playerOccupiesCell(p, x, y) {
+    const s = p.size || 1;
+    return x >= p.x && x < p.x + s && y >= p.y && y < p.y + s;
+  }
+  anyPlayerAt(x, y, excludeId) {
+    for (const p of Object.values(this.players)) {
+      if (!p.alive || p.id === excludeId) continue;
+      if (this.playerOccupiesCell(p, x, y)) return p;
+    }
+    return null;
+  }
   inBounds(x, y) { return inBoundsGlobal(x, y, this.gridSize); }
 
   // Cases centrales du mode Roi de la case, calculées selon la taille de grille active.
@@ -276,11 +374,16 @@ class Room {
       }
       return null;
     };
-    const walls = [], barrels = [], mud = [];
+    const walls = [], barrels = [], mud = [], heal = [], teleport = [], breakable = [], lightningRod = [], bush = [];
     for (let i = 0; i < def.walls; i++) { const c = pick(); if (c) walls.push(c); }
     for (let i = 0; i < def.barrels; i++) { const c = pick(); if (c) barrels.push({ ...c, id: crypto.randomUUID() }); }
     for (let i = 0; i < def.mud; i++) { const c = pick(); if (c) mud.push(c); }
-    this.obstacles = { walls, barrels, mud };
+    for (let i = 0; i < (def.heal || 0); i++) { const c = pick(); if (c) heal.push(c); }
+    for (let i = 0; i < (def.teleport || 0); i++) { const c = pick(); if (c) teleport.push(c); }
+    for (let i = 0; i < (def.breakable || 0); i++) { const c = pick(); if (c) breakable.push({ ...c, hp: BREAKABLE_WALL_HP }); }
+    for (let i = 0; i < (def.lightningRod || 0); i++) { const c = pick(); if (c) lightningRod.push(c); }
+    for (let i = 0; i < (def.bush || 0); i++) { const c = pick(); if (c) bush.push(c); }
+    this.obstacles = { walls, barrels, mud, heal, teleport, breakable, lightningRod, bush };
     this.mapId = MAPS[mapId] ? mapId : "open";
   }
 
@@ -298,24 +401,35 @@ class Room {
     const walls = cleanList(customMap.walls);
     const barrels = cleanList(customMap.barrels).map(c => ({ x: c.x, y: c.y, id: crypto.randomUUID() }));
     const mud = cleanList(customMap.mud);
-    const freeWalkable = this.gridSize * this.gridSize - walls.length - barrels.length;
+    const heal = cleanList(customMap.heal);
+    const teleport = cleanList(customMap.teleport);
+    const breakable = cleanList(customMap.breakable).map(c => ({ x: c.x, y: c.y, hp: BREAKABLE_WALL_HP }));
+    const lightningRod = cleanList(customMap.lightningRod);
+    const bush = cleanList(customMap.bush);
+    const freeWalkable = this.gridSize * this.gridSize - walls.length - barrels.length - breakable.length;
     if (freeWalkable < 12) { this.generateMap("open", excludeCells); return; }
-    this.obstacles = { walls, barrels, mud };
+    this.obstacles = { walls, barrels, mud, heal, teleport, breakable, lightningRod, bush };
     this.mapId = "custom";
   }
 
-  freeSpawn() {
+  freeSpawn(size) {
+    size = size || 1;
+    const fits = (x, y) => {
+      for (let dx = 0; dx < size; dx++) for (let dy = 0; dy < size; dy++) {
+        const cx = x + dx, cy = y + dy;
+        if (!this.inBounds(cx, cy) || this.isBlocked(cx, cy) || this.anyPlayerAt(cx, cy, null)) return false;
+      }
+      return true;
+    };
     for (let tries = 0; tries < 200; tries++) {
-      const x = randInt(this.gridSize), y = randInt(this.gridSize);
-      const occupied = Object.values(this.players).some(p => p.alive && p.x === x && p.y === y);
-      if (!occupied && !this.isBlocked(x, y) && !this.isVoid(x, y)) return { x, y };
+      const x = randInt(this.gridSize - size + 1), y = randInt(this.gridSize - size + 1);
+      if (fits(x, y) && !this.isVoid(x, y)) return { x, y };
     }
     for (let tries = 0; tries < 200; tries++) {
-      const x = randInt(this.gridSize), y = randInt(this.gridSize);
-      const occupied = Object.values(this.players).some(p => p.alive && p.x === x && p.y === y);
-      if (!occupied && !this.isBlocked(x, y)) return { x, y };
+      const x = randInt(this.gridSize - size + 1), y = randInt(this.gridSize - size + 1);
+      if (fits(x, y)) return { x, y };
     }
-    return { x: randInt(this.gridSize), y: randInt(this.gridSize) };
+    return { x: randInt(this.gridSize - size + 1), y: randInt(this.gridSize - size + 1) };
   }
 
   // ---- Joueurs / reconnexion ----
@@ -372,7 +486,7 @@ class Room {
       id, clientId: clientId || crypto.randomUUID(), pseudo: this.uniquePseudo(pseudo, null), color, avatarEmoji, x: spawn.x, y: spawn.y,
       hp: this.startingHP, alive: true, lastMove: 0, shield: false, respawnAt: null,
       eliminations: 0, score: 0, resistUntil: null, speedUntil: null, rootedUntil: null, slowedUntil: null, invulnUntil: null, forcedNextAttackId: null,
-      damageDealt: 0, damageTaken: 0, timesKO: 0, team: null,
+      damageDealt: 0, damageTaken: 0, timesKO: 0, team: null, biggestHit: 0, firstKillAt: null, lastTeleportAt: null, hidden: false, size: 1,
       connected: true, disconnectedAt: null, ws,
     };
     this.players[id] = player;
@@ -391,7 +505,7 @@ class Room {
       x: spawn.x, y: spawn.y,
       hp: this.startingHP, alive: true, lastMove: 0, shield: false, respawnAt: null,
       eliminations: 0, score: 0, resistUntil: null, speedUntil: null, rootedUntil: null, slowedUntil: null, invulnUntil: null, forcedNextAttackId: null,
-      damageDealt: 0, damageTaken: 0, timesKO: 0, team: null,
+      damageDealt: 0, damageTaken: 0, timesKO: 0, team: null, biggestHit: 0, firstKillAt: null, lastTeleportAt: null, hidden: false, size: 1,
       connected: true, disconnectedAt: null, ws: null, isBot: true,
       botDifficulty: BOT_DIFFICULTIES.includes(difficulty) ? difficulty : "medium",
     };
@@ -416,12 +530,13 @@ class Room {
       const id = fillBotIds.pop();
       delete this.players[id];
     }
-    let n = 1;
     while (fillBotIds.length < target) {
-      const bot = this.addBotPlayer(`Bot ${n}`, this.fillBotDifficulty);
+      const usedNames = Object.values(this.players).map(p => p.pseudo);
+      const available = shuffle(BOT_NAMES.filter(n => !usedNames.includes(n)));
+      const name = available[0] || `Bot ${fillBotIds.length + 1}`;
+      const bot = this.addBotPlayer(name, this.fillBotDifficulty);
       bot.isFillBot = true;
       fillBotIds.push(bot.id);
-      n++;
     }
   }
 
@@ -470,7 +585,7 @@ class Room {
     this.reassignHostOrClose(targetId);
     if (this.status === "playing") this.checkWinCondition();
     this.syncBotFill();
-    this.broadcast(this.publicState());
+    this.broadcastState();
   }
 
   // Transfert de la propriété du salon à un autre joueur connecté.
@@ -479,7 +594,7 @@ class Room {
     if (!p || !p.connected) return;
     this.hostId = targetId;
     this.pushLog(`${p.pseudo} est désormais l'hôte.`);
-    this.broadcast(this.publicState());
+    this.broadcastState();
   }
 
   purgeStaleDisconnected() {
@@ -509,7 +624,7 @@ class Room {
     this.pendingAttacks.clear();
     this.activeTelegraphs = [];
     this.pushLog("L'hôte a terminé la partie. Retour au salon.");
-    this.broadcast(this.publicState());
+    this.broadcastState();
   }
 
   // ---- Démarrage / relance ----
@@ -531,7 +646,7 @@ class Room {
 
     this.mode = mode;
     this.config = config;
-    this.gridSize = clamp(Math.round(numOr(rawConfig.gridSize, DEFAULT_GRID_SIZE)), DEFAULT_GRID_SIZE_MIN, DEFAULT_GRID_SIZE_MAX);
+    this.gridSize = DEFAULT_GRID_SIZE; // taille fixe, plus configurable par l'hôte
     this.winner = null;
     this.hazards = [];
     this.powerups = [];
@@ -559,6 +674,8 @@ class Room {
     this.barrelDamage = clamp(Math.round(numOr(rawConfig.barrelDamage, DEFAULT_BARREL_DAMAGE)), 0, 100);
     this.powerupMaxOnMap = clamp(Math.round(numOr(rawConfig.powerupMaxOnMap, DEFAULT_POWERUP_MAX_ON_MAP)), 0, 8);
     this.weaponNoRepeat = rawConfig.weaponNoRepeat !== false && rawConfig.weaponNoRepeat !== "false";
+    this.hideAttackFromOthers = rawConfig.hideAttackFromOthers !== false && rawConfig.hideAttackFromOthers !== "false";
+    this.twoWeaponHand = rawConfig.twoWeaponHand === true || rawConfig.twoWeaponHand === "true";
     this.mineVisibleToAll = rawConfig.mineVisibleToAll === true || rawConfig.mineVisibleToAll === "true";
 
     this.attackWeightOverrides = {};
@@ -629,14 +746,15 @@ class Room {
 
     const playerList = Object.values(this.players);
     playerList.forEach((p, idx) => {
-      const spawn = this.freeSpawn();
       const isBoss = mode === "boss" && p.id === this.bossId;
+      p.size = isBoss ? 2 : 1;
+      const spawn = this.freeSpawn(p.size);
       p.hp = isBoss ? Math.round(this.startingHP * this.bossHpMultiplier) : this.startingHP;
       p.alive = true; p.x = spawn.x; p.y = spawn.y;
       p.shield = false; p.respawnAt = null; p.resistUntil = null; p.speedUntil = null;
       p.rootedUntil = null; p.slowedUntil = null;
       p.invulnUntil = this.spawnProtectionSec > 0 ? Date.now() + this.spawnProtectionSec * 1000 : null;
-      p.eliminations = 0; p.score = 0; p.damageDealt = 0; p.damageTaken = 0; p.timesKO = 0;
+      p.eliminations = 0; p.score = 0; p.damageDealt = 0; p.damageTaken = 0; p.timesKO = 0; p.biggestHit = 0; p.firstKillAt = null; p.lastTeleportAt = null; p.hidden = false;
       p.team = this.teamsEnabled ? (idx % 2 === 0 ? "A" : "B") : null;
     });
 
@@ -645,8 +763,16 @@ class Room {
     if (mode === "chrono") this.chronoEndAt = Date.now() + config.minutes * 60000;
     else this.chronoEndAt = null;
 
+    this.mapModifiers = Array.isArray(rawConfig.mapModifiers) ? rawConfig.mapModifiers.filter(m => MAP_MODIFIERS[m]) : [];
+    this.modifierNextAt = {};
+    this.zombies = [];
+    for (const m of this.mapModifiers) {
+      const [lo, hi] = MAP_MODIFIER_INTERVAL_SEC[m];
+      this.modifierNextAt[m] = this.matchStartedAt + (lo + Math.random() * (hi - lo)) * 1000;
+    }
+
     this.pushLog(`Partie lancée — mode ${MODES[mode].label} sur ${MAPS[this.mapId].label}${this.teamsEnabled ? " — par équipes" : ""} !`);
-    this.broadcast(this.publicState());
+    this.broadcastState();
 
     if (this.hillTimer) clearInterval(this.hillTimer);
     if (mode === "kingHill") {
@@ -680,7 +806,7 @@ class Room {
     this.turn = null;
     const names = winnerIds.map(id => this.players[id]?.pseudo).filter(Boolean);
     this.pushLog(names.length ? `Victoire de ${names.join(" et ")} !` : "Match nul — personne ne l'emporte.");
-    this.broadcast(this.publicState());
+    this.broadcastState();
   }
 
   checkWinCondition() {
@@ -754,7 +880,10 @@ class Room {
     player.damageTaken += amount;
     if (attackerId) {
       const attacker = this.players[attackerId];
-      if (attacker && attacker.id !== player.id) attacker.damageDealt += amount;
+      if (attacker && attacker.id !== player.id) {
+        attacker.damageDealt += amount;
+        if (amount > attacker.biggestHit) attacker.biggestHit = amount;
+      }
     }
     if (player.hp === 0) this.onElimination(attackerId, player);
   }
@@ -764,6 +893,11 @@ class Room {
     victim.alive = false;
     victim.timesKO += 1;
     this.pushLog(`${victim.pseudo} est K.O. !`);
+
+    if (attackerId && attackerId !== victim.id) {
+      const attacker = this.players[attackerId];
+      if (attacker && !attacker.firstKillAt) attacker.firstKillAt = Date.now();
+    }
 
     if (this.mode === "ctf") {
       const dropped = this.flags.find(f => f.carrierId === victim.id);
@@ -799,6 +933,23 @@ class Room {
     for (const p of Object.values(this.players)) {
       if (!p.alive || excludeIds.has(p.id)) continue;
       const d = Math.abs(p.x - x) + Math.abs(p.y - y);
+      if (d < bestDist) { bestDist = d; best = p; }
+    }
+    return best;
+  }
+
+  // Cible d'un bot : jamais un coéquipier. Pour les attaques en ligne (direction),
+  // privilégie un ennemi déjà parfaitement aligné (même ligne/colonne) pour ne pas
+  // tirer dans le vide, sinon se rabat sur le plus proche.
+  botPickTarget(bot, preferAligned) {
+    const enemies = Object.values(this.players).filter(p =>
+      p.alive && p.id !== bot.id && !(this.teamsEnabled && bot.team && p.team === bot.team));
+    if (!enemies.length) return null;
+    const pool = preferAligned ? enemies.filter(p => p.x === bot.x || p.y === bot.y) : enemies;
+    const from = pool.length ? pool : enemies;
+    let best = null, bestDist = Infinity;
+    for (const p of from) {
+      const d = Math.abs(p.x - bot.x) + Math.abs(p.y - bot.y);
       if (d < bestDist) { bestDist = d; best = p; }
     }
     return best;
@@ -871,7 +1022,19 @@ class Room {
 
   // ---- Tonneaux : explosion en chaîne ----
   triggerBarrelChain(attackerId, startCells) {
-    const hitPlayerAt = (x, y) => Object.values(this.players).find(p => p.alive && p.x === x && p.y === y);
+    const hitPlayerAt = (x, y) => this.anyPlayerAt(x, y);
+
+    // Murs cassables (carte Jardin) : encaissent des dégâts à chaque impact, peu importe l'attaque.
+    for (const c of startCells) {
+      const wall = this.isBreakable(c.x, c.y);
+      if (!wall) continue;
+      wall.hp -= BREAKABLE_WALL_DAMAGE_PER_HIT;
+      if (wall.hp <= 0) {
+        this.obstacles.breakable = this.obstacles.breakable.filter(w => w !== wall);
+        this.pushLog("Un mur cède sous les coups !");
+      }
+    }
+
     const queue = startCells.slice();
     const extra = [];
     const exploded = new Set();
@@ -909,17 +1072,23 @@ class Room {
     if (now - player.lastMove < cooldown) return;
 
     const { x, y } = msg;
-    if (typeof x !== "number" || typeof y !== "number" || !this.inBounds(x, y)) return;
+    if (typeof x !== "number" || typeof y !== "number") return;
     const dx = x - player.x, dy = y - player.y;
     if (!((Math.abs(dx) === 1 && dy === 0) || (dx === 0 && Math.abs(dy) === 1))) return;
-    if (this.isBlocked(x, y)) return;
 
-    const occupant = Object.values(this.players).find(p => p.alive && p.id !== player.id && p.x === x && p.y === y);
+    // Empreinte complète à la nouvelle position (1 case, ou 2x2 pour le Boss).
+    const size = player.size || 1;
+    const newCells = [];
+    for (let ddx = 0; ddx < size; ddx++) for (let ddy = 0; ddy < size; ddy++) newCells.push({ x: x + ddx, y: y + ddy });
+    if (!newCells.every(c => this.inBounds(c.x, c.y))) return;
+    if (newCells.some(c => this.isBlocked(c.x, c.y))) return;
+
+    const occupant = newCells.map(c => this.anyPlayerAt(c.x, c.y, player.id)).find(Boolean);
     if (occupant) {
-      if (!this.pushEnabled) return;
-      const pushX = x + dx, pushY = y + dy;
+      if (!this.pushEnabled || (occupant.size || 1) > 1) return; // trop imposant (le Boss) pour être poussé
+      const pushX = occupant.x + dx, pushY = occupant.y + dy;
       const pushBlocked = !this.inBounds(pushX, pushY) || this.isBlocked(pushX, pushY) ||
-        Object.values(this.players).some(p => p.alive && p.id !== occupant.id && p.x === pushX && p.y === pushY);
+        !!this.anyPlayerAt(pushX, pushY, occupant.id);
       if (pushBlocked) return;
       occupant.x = pushX; occupant.y = pushY;
       this.pushLog(`${player.pseudo} pousse ${occupant.pseudo} !`);
@@ -930,12 +1099,45 @@ class Room {
     this.checkMineTrigger(player, x, y);
     this.checkPowerupPickup(player, x, y);
     this.checkFlagInteractions(player, x, y);
+    this.checkTeleportTile(player, player.x, player.y);
+    player.hidden = this.isBush(player.x, player.y);
 
-    this.broadcast(this.publicState());
+    this.broadcastState();
+  }
+
+  // Carte Labo : marcher sur une case de téléportation envoie vers une autre case
+  // de téléportation au hasard, avec un temps de recharge par joueur pour éviter le spam.
+  checkTeleportTile(player, x, y) {
+    if (!this.isTeleport(x, y)) return;
+    const now = Date.now();
+    if (player.lastTeleportAt && now - player.lastTeleportAt < TELEPORT_TILE_COOLDOWN_MS) return;
+    const others = (this.obstacles.teleport || []).filter(t => !(t.x === x && t.y === y));
+    if (!others.length) return;
+    const dest = others[randInt(others.length)];
+    const occupied = !!this.anyPlayerAt(dest.x, dest.y, player.id);
+    if (occupied) return;
+    player.x = dest.x; player.y = dest.y;
+    player.lastTeleportAt = now;
+    player.hidden = this.isBush(player.x, player.y);
+    this.pushLog(`${player.pseudo} est téléporté !`);
   }
 
   // Codes secrets : "nuke" force la bombe nucléaire au prochain tour du joueur ;
   // "choose" force n'importe quelle autre attaque valide (jamais la bombe elle-même).
+  // Main de 2 armes : le joueur actif peut choisir laquelle des deux armes
+  // tirées au sort il veut utiliser, avant de viser.
+  handleChooseWeapon(player, msg) {
+    if (!this.turn || this.turn.playerId !== player.id || !this.turn.altAttack) return;
+    if (msg.attackId === this.turn.altAttack.id) {
+      const previous = this.turn.attack;
+      this.turn.attack = this.turn.altAttack;
+      this.turn.altAttack = previous;
+      this.lastAttackId = this.turn.attack.id;
+      this.broadcastState();
+    }
+    // Si msg.attackId correspond déjà à l'arme active, rien à faire.
+  }
+
   handleCheatCode(player, msg) {
     if (msg.code === "nuke") {
       player.forcedNextAttackId = "nuke";
@@ -956,7 +1158,7 @@ class Room {
         player.speedUntil = Math.max(player.speedUntil || 0, Date.now() + durMs);
       }
       this.pushLog(`${player.pseudo} a activé un code secret… 👀`);
-      this.broadcast(this.publicState()); // effet immédiat, contrairement aux deux codes ci-dessus
+      this.broadcastState(); // effet immédiat, contrairement aux deux codes ci-dessus
     }
   }
 
@@ -973,14 +1175,14 @@ class Room {
       // terminer et afficher l'écran de victoire avant même que l'animation ne commence.
       this.pushLog(`${player.pseudo} déclenche ${attack.name} !`);
       this.broadcast({ type: "attackResolved", attackId: attack.id, by: player.id, cells: [], groups: null });
-      this.broadcast(this.publicState());
+      this.broadcastState();
       const handle = setTimeout(() => {
         this.pendingAttacks.delete(handle);
         if (this.status !== "playing") return;
         const liveAttacker = this.players[player.id];
         if (!liveAttacker) return;
         this.resolveAttackEffects(liveAttacker, attack, msg, null);
-        this.broadcast(this.publicState());
+        this.broadcastState();
       }, NUKE_RESOLVE_DELAY_MS);
       if (handle.unref) handle.unref();
       this.pendingAttacks.add(handle);
@@ -1011,13 +1213,13 @@ class Room {
         if (!liveAttacker) return;
         const result = this.resolveAttackEffects(liveAttacker, attack, msg, cells);
         this.broadcast({ type: "attackResolved", attackId: attack.id, by: liveAttacker.id, cells: result.cells, groups: result.groups || null });
-        this.broadcast(this.publicState());
+        this.broadcastState();
       }, delay);
       if (handle.unref) handle.unref();
       this.pendingAttacks.add(handle);
     }
 
-    this.broadcast(this.publicState());
+    this.broadcastState();
     if (this.status === "playing") this.scheduleTick(this.turnGapSec * 1000);
   }
 
@@ -1083,7 +1285,7 @@ class Room {
   // n'est renseigné que pour les attaques "en rafale" (staggered côté client) —
   // il sert à afficher/jouer chaque impact un par un plutôt que tous en même temps.
   resolveAttackEffects(player, attack, msg, precomputedCells) {
-    const hitPlayerAt = (x, y) => Object.values(this.players).find(p => p.alive && p.x === x && p.y === y);
+    const hitPlayerAt = (x, y) => this.anyPlayerAt(x, y);
     let affected = [];
     let groups = null;
 
@@ -1132,7 +1334,7 @@ class Room {
       }
       if (attack.target === "direction" && attack.moveSelf) {
         const dest = originalCells[originalCells.length - 1] || { x: player.x, y: player.y };
-        const occupied = Object.values(this.players).some(p => p.alive && p.id !== player.id && p.x === dest.x && p.y === dest.y);
+        const occupied = !!this.anyPlayerAt(dest.x, dest.y, player.id);
         if (!occupied && !this.isBlocked(dest.x, dest.y)) { player.x = dest.x; player.y = dest.y; }
       }
       return { cells: affected, groups };
@@ -1175,6 +1377,20 @@ class Room {
         if (!next) break;
         cx = next.x; cy = next.y;
       }
+
+      // Paratonnerre (carte Labo) : mini-explosion si l'éclair passe à proximité.
+      for (const rod of (this.obstacles.lightningRod || [])) {
+        const nearChain = chainCells.some(c => Math.max(Math.abs(c.x - rod.x), Math.abs(c.y - rod.y)) <= LIGHTNING_ROD_RADIUS);
+        if (!nearChain) continue;
+        this.pushLog("⚡ Un paratonnerre déclenche une mini-explosion !");
+        const rodCells = this.cellsForZone(rod.x, rod.y, 3);
+        for (const rc of rodCells) {
+          const rp = this.anyPlayerAt(rc.x, rc.y);
+          if (rp) this.applyDamage(player.id, rp, LIGHTNING_ROD_BONUS_DAMAGE);
+        }
+        chainCells.push(...rodCells);
+      }
+
       affected = chainCells.concat(this.triggerBarrelChain(player.id, chainCells));
       groups = chainCells.map(c => [c]);
     } else if (attack.target === "cell" && attack.instant && !attack.subSize) {
@@ -1196,7 +1412,7 @@ class Room {
       affected = affected.concat(this.triggerBarrelChain(player.id, affected));
       if (attack.moveSelf) {
         const dest = cells[cells.length - 1] || { x: player.x, y: player.y };
-        const occupied = Object.values(this.players).some(p => p.alive && p.id !== player.id && p.x === dest.x && p.y === dest.y);
+        const occupied = !!this.anyPlayerAt(dest.x, dest.y, player.id);
         if (!occupied && !this.isBlocked(dest.x, dest.y)) { player.x = dest.x; player.y = dest.y; }
       }
     } else if (attack.target === "self" && attack.nuke) {
@@ -1219,7 +1435,7 @@ class Room {
         for (const [dx, dy] of shuffle(dirOptions)) {
           const nx = v.x + dx, ny = v.y + dy;
           if (!this.inBounds(nx, ny) || this.isBlocked(nx, ny)) continue;
-          const occupied = Object.values(this.players).some(p => p.alive && p.id !== v.id && p.x === nx && p.y === ny);
+          const occupied = !!this.anyPlayerAt(nx, ny, v.id);
           if (occupied) continue;
           v.x = nx; v.y = ny;
           break;
@@ -1278,7 +1494,7 @@ class Room {
       if (p.alive && this.onHill(p.x, p.y)) { p.score += 1; changed = true; }
     }
     if (changed) {
-      this.broadcast(this.publicState());
+      this.broadcastState();
       this.checkWinCondition();
     }
   }
@@ -1295,9 +1511,13 @@ class Room {
       const fled = rooted ? false : this.botTryFlee(bot);
 
       if (!fled && !rooted) {
+        const maxHp = (this.bossId === bot.id) ? Math.round(this.startingHP * this.bossHpMultiplier) : this.startingHP;
+        const onHealingZone = bot.hp < maxHp && this.hazards.some(h =>
+          h.type === "healzone" && this.cellsForZone(h.x, h.y, h.size).some(c => c.x === bot.x && c.y === bot.y));
         // Comportement neutre : ne traque jamais un joueur. Bouge au hasard une
-        // fois sur deux environ, ou reste simplement immobile.
-        if (Math.random() < BOT_RANDOM_MOVE_CHANCE) {
+        // fois sur deux environ, ou reste immobile — et reste volontairement sur
+        // une zone de soin tant qu'il n'a pas récupéré tous ses PV.
+        if (!onHealingZone && Math.random() < BOT_RANDOM_MOVE_CHANCE) {
           for (const [dx, dy] of shuffle([[1, 0], [-1, 0], [0, 1], [0, -1]])) {
             const m = { x: bot.x + dx, y: bot.y + dy };
             if (this.inBounds(m.x, m.y) && !this.isBlocked(m.x, m.y)) { this.handleMove(bot, m); break; }
@@ -1390,7 +1610,8 @@ class Room {
 
   botFireAttack(bot) {
     const attack = this.turn.attack;
-    const target = this.nearestAliveExcluding(bot.x, bot.y, new Set([bot.id])) || bot;
+    const needsAlignment = attack.target === "direction" || attack.target === "line";
+    const target = this.botPickTarget(bot, needsAlignment) || bot;
     let msg = { x: target.x, y: target.y };
     if (attack.target === "direction") {
       const dx = target.x - bot.x, dy = target.y - bot.y;
@@ -1399,8 +1620,78 @@ class Room {
       msg.axis = Math.abs(target.x - bot.x) > Math.abs(target.y - bot.y) ? "row" : "col";
     } else if (attack.target === "ally") {
       msg = { targetId: bot.id }; // simplicité : le bot se soigne lui-même
+    } else if (attack.healZone) {
+      msg = { x: bot.x, y: bot.y }; // une zone de soin se pose toujours sur soi, jamais sur un adversaire
     }
     this.handleAttack(bot, msg);
+  }
+
+  // ---- Modificateurs de carte (cumulables) : météorites, orage, séisme, pluie acide, cimetière ----
+  tickMapModifiers() {
+    if (!this.mapModifiers || !this.mapModifiers.length) return;
+    const now = Date.now();
+    for (const m of this.mapModifiers) {
+      if (now < (this.modifierNextAt[m] || 0)) continue;
+      this.fireMapModifier(m);
+      const [lo, hi] = MAP_MODIFIER_INTERVAL_SEC[m];
+      this.modifierNextAt[m] = now + (lo + Math.random() * (hi - lo)) * 1000;
+    }
+    this.tickZombies();
+  }
+
+  fireMapModifier(id) {
+    const alive = Object.values(this.players).filter(p => p.alive);
+    if (id === "meteorRain") {
+      const x = randInt(this.gridSize), y = randInt(this.gridSize);
+      const cells = this.cellsForZone(x, y, 3);
+      for (const c of cells) {
+        const p = alive.find(pl => this.playerOccupiesCell(pl, c.x, c.y));
+        if (p) this.applyDamage(null, p, 18);
+      }
+      this.broadcast({ type: "mapEvent", kind: "meteorRain", cells });
+      this.pushLog("☄️ Une météorite s'écrase !");
+    } else if (id === "storm") {
+      if (!alive.length) return;
+      const target = alive[randInt(alive.length)];
+      this.applyDamage(null, target, 14);
+      this.broadcast({ type: "mapEvent", kind: "storm", cells: [{ x: target.x, y: target.y }] });
+      this.pushLog("🌩️ La foudre frappe !");
+    } else if (id === "earthquakeMod") {
+      for (const p of alive) this.applyDamage(null, p, 6);
+      this.broadcast({ type: "mapEvent", kind: "earthquakeMod", cells: [] });
+      this.pushLog("🌍 Le sol tremble !");
+    } else if (id === "acidRainMod") {
+      const x = randInt(this.gridSize), y = randInt(this.gridSize);
+      this.hazards.push({ type: "poison", x, y, size: 2, damage: 5, ticks: 4, ownerId: null });
+      this.broadcast({ type: "mapEvent", kind: "acidRainMod", cells: [{ x, y }] });
+      this.pushLog("🧪 Une pluie acide tombe...");
+    } else if (id === "cemetery") {
+      if (this.zombies.length >= ZOMBIE_MAX_ALIVE) return;
+      const spot = this.freeSpawn();
+      this.zombies.push({ id: crypto.randomUUID(), x: spot.x, y: spot.y });
+      this.pushLog("🧟 Une ombre surgit du cimetière...");
+    }
+  }
+
+  tickZombies() {
+    if (!this.zombies || !this.zombies.length) return;
+    for (const z of this.zombies.slice()) {
+      const target = this.nearestAliveExcluding(z.x, z.y, new Set());
+      if (target) {
+        const dx = Math.sign(target.x - z.x), dy = Math.sign(target.y - z.y);
+        const moves = shuffle([[dx, 0], [0, dy]].filter(([a, b]) => a !== 0 || b !== 0));
+        for (const [mx, my] of moves) {
+          const nx = z.x + mx, ny = z.y + my;
+          if (this.inBounds(nx, ny) && !this.isBlocked(nx, ny)) { z.x = nx; z.y = ny; break; }
+        }
+      }
+      const hitP = this.anyPlayerAt(z.x, z.y);
+      if (hitP) {
+        this.applyDamage(null, hitP, ZOMBIE_EXPLOSION_DAMAGE);
+        this.zombies = this.zombies.filter(zz => zz.id !== z.id);
+        this.pushLog(`💥 Une ombre explose sur ${hitP.pseudo} !`);
+      }
+    }
   }
 
   secondTick() {
@@ -1411,7 +1702,7 @@ class Room {
 
     for (const p of Object.values(this.players)) {
       if (!p.alive && p.respawnAt && Date.now() >= p.respawnAt) {
-        const spawn = this.freeSpawn();
+        const spawn = this.freeSpawn(p.size);
         p.alive = true; p.hp = Math.round(this.startingHP * (this.respawnHpPercent / 100)); p.x = spawn.x; p.y = spawn.y; p.respawnAt = null;
         p.invulnUntil = this.spawnProtectionSec > 0 ? Date.now() + this.spawnProtectionSec * 1000 : null;
         this.pushLog(`${p.pseudo} revient dans l'arène.`);
@@ -1423,6 +1714,13 @@ class Room {
         if (p.alive && p.hp < this.startingHP) this.applyHeal(p, this.passiveRegenPerSec);
       }
     }
+
+    // Zones de soin de la carte (carte Labo) : soigne quiconque reste dessus.
+    for (const p of Object.values(this.players)) {
+      if (p.alive && p.hp < this.startingHP && this.isHeal(p.x, p.y)) this.applyHeal(p, HEAL_TILE_PER_SEC);
+    }
+
+    this.tickMapModifiers();
 
     this.hazards = this.hazards.filter(h => {
       if (h.type !== "poison" && h.type !== "frost" && h.type !== "fire" && h.type !== "healzone") return true;
@@ -1467,7 +1765,7 @@ class Room {
       }
     }
 
-    this.broadcast(this.publicState());
+    this.broadcastState();
   }
 
   resolveChronoEnd() {
@@ -1484,7 +1782,7 @@ class Room {
         this.suddenDeathIds = new Set(list.filter(p => top.includes(p.team)).map(p => p.id));
         this.chronoEndAt = null;
         this.pushLog("Égalité entre équipes ! Mort subite : le prochain K.O. gagne.");
-        this.broadcast(this.publicState());
+        this.broadcastState();
         return;
       }
       this.endGame([], "chrono");
@@ -1499,7 +1797,7 @@ class Room {
       this.suddenDeathIds = new Set(top.map(p => p.id));
       this.chronoEndAt = null;
       this.pushLog("Égalité ! Mort subite : le prochain K.O. gagne.");
-      this.broadcast(this.publicState());
+      this.broadcastState();
       return;
     }
     this.endGame([], "chrono");
@@ -1552,7 +1850,7 @@ class Room {
       const p = this.players[this.turn.playerId];
       this.pushLog(`${p ? p.pseudo : "Le joueur"} n'a pas utilisé son arme à temps.`);
       this.turn = null;
-      this.broadcast(this.publicState());
+      this.broadcastState();
       this.scheduleTick(this.turnGapSec * 1000);
       return;
     }
@@ -1560,7 +1858,7 @@ class Room {
     if (!this.turn) {
       const chosen = this.pickNextAttacker();
       if (!chosen) { this.scheduleTick(1000); return; }
-      let attack;
+      let attack, altAttack = null;
       if (chosen.forcedNextAttackId) {
         attack = this.attacksRuntime.find(a => a.id === chosen.forcedNextAttackId) || ATTACKS.find(a => a.id === chosen.forcedNextAttackId);
         chosen.forcedNextAttackId = null;
@@ -1570,14 +1868,19 @@ class Room {
           let guard = 0;
           while (attack.id === this.lastAttackId && guard < 10) { attack = this.pickWeightedAttack(); guard++; }
         }
+        if (this.twoWeaponHand && this.attacksRuntime.length > 1) {
+          let guard = 0;
+          do { altAttack = this.pickWeightedAttack(); guard++; } while (altAttack.id === attack.id && guard < 10);
+          if (altAttack.id === attack.id) altAttack = null; // aucune autre arme distincte disponible
+        }
       }
       this.lastAttackId = attack.id;
       const deadline = Date.now() + this.attackWindowSec * 1000;
-      this.turn = { playerId: chosen.id, attack, deadline };
+      this.turn = { playerId: chosen.id, attack, altAttack, deadline };
       // Charge : un peu plus vif tant qu'on l'a en main, pour repositionner son élan.
       if (attack.id === "charge") chosen.speedUntil = Math.max(chosen.speedUntil || 0, deadline);
       this.pushLog(`${chosen.pseudo} reçoit : ${attack.name} !`);
-      this.broadcast(this.publicState());
+      this.broadcastState();
       this.scheduleTick(this.attackWindowSec * 1000 + 200);
     } else {
       this.scheduleTick(1000);
@@ -1687,7 +1990,7 @@ server.on("upgrade", (req, socket, head) => {
     if (!player) { ws.send(JSON.stringify({ type: "error", message: "Partie pleine." })); ws.close(1008, "full"); return; }
 
     ws.send(JSON.stringify({
-      type: "welcome", playerId: player.id, code: room.code, modes: MODES, maps: MAPS,
+      type: "welcome", playerId: player.id, code: room.code, modes: MODES, maps: MAPS, mapModifiers: MAP_MODIFIERS,
       attacks: ATTACKS.filter(a => !a.secret).map(a => ({ id: a.id, name: a.name, weight: a.weight !== undefined ? a.weight : 1, tunables: getAttackTunables(a) })),
     }));
     room.pushLog(`${pseudo} a rejoint la partie.`);
@@ -1723,6 +2026,8 @@ server.on("upgrade", (req, socket, head) => {
         room.kickPlayer(msg.targetId);
       } else if (msg.type === "transferHost" && player.id === room.hostId && msg.targetId !== room.hostId) {
         room.transferHost(msg.targetId);
+      } else if (msg.type === "chooseWeapon" && room.status === "playing") {
+        room.handleChooseWeapon(p, msg);
       } else if (msg.type === "cheatCode" && room.status === "playing") {
         room.handleCheatCode(p, msg);
       } else if (msg.type === "reaction" && room.status === "playing" && typeof msg.emoji === "string") {
