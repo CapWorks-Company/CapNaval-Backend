@@ -2059,6 +2059,8 @@ server.on("upgrade", (req, socket, head) => {
         room.handleAttack(p, msg);
       } else if (msg.type === "endMatch" && player.id === room.hostId && room.status === "playing") {
         room.abortToLobby();
+      } else if (msg.type === "backToLobby" && player.id === room.hostId && room.status === "ended") {
+        room.abortToLobby();
       } else if (msg.type === "setPublic" && player.id === room.hostId) {
         room.isPublic = !!msg.value;
         room.broadcast(room.publicState());
