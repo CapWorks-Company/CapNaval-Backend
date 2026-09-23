@@ -31,10 +31,32 @@ const MAP_MODIFIERS = {
   acidRainMod:   { label: "Pluie acide",      desc: "De l'acide tombe en continu, mais rarement.",        icon: "🧪" },
   cemetery:      { label: "Cimetière",        desc: "Des ombres sans nom surgissent et explosent au contact.", icon: "🧟" },
 };
-const MAP_MODIFIER_INTERVAL_SEC = {
-  meteorRain: [8, 15], storm: [10, 18], earthquakeMod: [15, 25], acidRainMod: [22, 34], cemetery: [12, 22],
+// Réglages fins par modificateur (bornes de sécurité incluses) : fréquence en
+// occurrences par minute, plus quelques champs propres à chaque modificateur.
+const MODIFIER_TUNABLE_RANGES = {
+  meteorRain:    { perMinute: [1, 12, 4.5], damage: [5, 40, 18] },
+  storm:         { perMinute: [1, 12, 4],   damage: [5, 30, 14] },
+  earthquakeMod: { perMinute: [1, 8, 3],    damage: [2, 20, 6] },
+  acidRainMod:   { perMinute: [0.5, 8, 2.2], damage: [2, 20, 5], size: [1, 5, 2] },
+  cemetery:      { perMinute: [0.5, 8, 3.3], zombieHp: [10, 150, 50], explosionDamage: [5, 60, 22] },
 };
+function defaultModifierSettings() {
+  const out = {};
+  for (const [id, fields] of Object.entries(MODIFIER_TUNABLE_RANGES)) {
+    out[id] = {};
+    for (const [field, [, , def]] of Object.entries(fields)) out[id][field] = def;
+  }
+  return out;
+}
+// Intervalle (min, max) en secondes déduit du réglage "par minute" (±30% pour éviter un rythme trop prévisible).
+function modifierIntervalSec(room, id) {
+  const perMinute = (room.modifierSettings[id] && room.modifierSettings[id].perMinute) || MODIFIER_TUNABLE_RANGES[id].perMinute[2];
+  const avg = 60 / perMinute;
+  return [avg * 0.7, avg * 1.3];
+}
 const ZOMBIE_MAX_ALIVE = 3;
+const ZOMBIE_HP = 50;
+const ZOMBIE_DAMAGE_PER_HIT = 20;
 const ZOMBIE_EXPLOSION_DAMAGE = 22;
 const DEFAULT_TELEGRAPH_MS = 1300;
 const NUKE_RESOLVE_DELAY_MS = 2000; // dégâts appliqués juste au moment de la vraie explosion (après le faux départ), côté client
@@ -187,6 +209,7 @@ class Room {
     this.activeTelegraphs = [];
     this.matchStartedAt = 0;
     this.mapModifiers = [];
+    this.modifierSettings = defaultModifierSettings();
     this.modifierNextAt = {};
     this.zombies = [];
     this.turnQueue = [];
@@ -300,6 +323,7 @@ class Room {
         spawnProtectionSec: this.spawnProtectionSec,
         passiveRegenPerSec: this.passiveRegenPerSec,
         attackWeightOverrides: this.attackWeightOverrides,
+        modifierOverrides: this.modifierSettings,
       },
       chronoEndAt: this.chronoEndAt,
       matchStartedAt: this.matchStartedAt,
@@ -764,10 +788,19 @@ class Room {
     else this.chronoEndAt = null;
 
     this.mapModifiers = Array.isArray(rawConfig.mapModifiers) ? rawConfig.mapModifiers.filter(m => MAP_MODIFIERS[m]) : [];
+    this.modifierSettings = defaultModifierSettings();
+    const modOverrides = (rawConfig.modifierOverrides && typeof rawConfig.modifierOverrides === "object") ? rawConfig.modifierOverrides : {};
+    for (const [id, fields] of Object.entries(MODIFIER_TUNABLE_RANGES)) {
+      const submitted = modOverrides[id] || {};
+      for (const [field, [min, max]] of Object.entries(fields)) {
+        const val = numOr(submitted[field], this.modifierSettings[id][field]);
+        this.modifierSettings[id][field] = clamp(val, min, max);
+      }
+    }
     this.modifierNextAt = {};
     this.zombies = [];
     for (const m of this.mapModifiers) {
-      const [lo, hi] = MAP_MODIFIER_INTERVAL_SEC[m];
+      const [lo, hi] = modifierIntervalSec(this, m);
       this.modifierNextAt[m] = this.matchStartedAt + (lo + Math.random() * (hi - lo)) * 1000;
     }
 
@@ -1032,6 +1065,19 @@ class Room {
       if (wall.hp <= 0) {
         this.obstacles.breakable = this.obstacles.breakable.filter(w => w !== wall);
         this.pushLog("Un mur cède sous les coups !");
+      }
+    }
+
+    // Ombres du cimetière : peuvent aussi être attaquées et tuées par les joueurs.
+    if (this.zombies && this.zombies.length) {
+      for (const c of startCells) {
+        const z = this.zombies.find(zz => zz.x === c.x && zz.y === c.y);
+        if (!z) continue;
+        z.hp -= ZOMBIE_DAMAGE_PER_HIT;
+        if (z.hp <= 0) {
+          this.zombies = this.zombies.filter(zz => zz.id !== z.id);
+          this.pushLog("🧟 Une ombre est détruite !");
+        }
       }
     }
 
@@ -1633,7 +1679,7 @@ class Room {
     for (const m of this.mapModifiers) {
       if (now < (this.modifierNextAt[m] || 0)) continue;
       this.fireMapModifier(m);
-      const [lo, hi] = MAP_MODIFIER_INTERVAL_SEC[m];
+      const [lo, hi] = modifierIntervalSec(this, m);
       this.modifierNextAt[m] = now + (lo + Math.random() * (hi - lo)) * 1000;
     }
     this.tickZombies();
@@ -1641,34 +1687,37 @@ class Room {
 
   fireMapModifier(id) {
     const alive = Object.values(this.players).filter(p => p.alive);
+    const s = this.modifierSettings[id] || {};
     if (id === "meteorRain") {
       const x = randInt(this.gridSize), y = randInt(this.gridSize);
       const cells = this.cellsForZone(x, y, 3);
       for (const c of cells) {
         const p = alive.find(pl => this.playerOccupiesCell(pl, c.x, c.y));
-        if (p) this.applyDamage(null, p, 18);
+        if (p) this.applyDamage(null, p, s.damage);
       }
       this.broadcast({ type: "mapEvent", kind: "meteorRain", cells });
       this.pushLog("☄️ Une météorite s'écrase !");
     } else if (id === "storm") {
       if (!alive.length) return;
       const target = alive[randInt(alive.length)];
-      this.applyDamage(null, target, 14);
+      this.applyDamage(null, target, s.damage);
       this.broadcast({ type: "mapEvent", kind: "storm", cells: [{ x: target.x, y: target.y }] });
       this.pushLog("🌩️ La foudre frappe !");
     } else if (id === "earthquakeMod") {
-      for (const p of alive) this.applyDamage(null, p, 6);
-      this.broadcast({ type: "mapEvent", kind: "earthquakeMod", cells: [] });
+      const cells = alive.map(p => ({ x: p.x, y: p.y }));
+      for (const p of alive) this.applyDamage(null, p, s.damage);
+      this.broadcast({ type: "mapEvent", kind: "earthquakeMod", cells });
       this.pushLog("🌍 Le sol tremble !");
     } else if (id === "acidRainMod") {
       const x = randInt(this.gridSize), y = randInt(this.gridSize);
-      this.hazards.push({ type: "poison", x, y, size: 2, damage: 5, ticks: 4, ownerId: null });
-      this.broadcast({ type: "mapEvent", kind: "acidRainMod", cells: [{ x, y }] });
+      const size = Math.round(s.size);
+      this.hazards.push({ type: "poison", x, y, size, damage: s.damage, ticks: 4, ownerId: null });
+      this.broadcast({ type: "mapEvent", kind: "acidRainMod", cells: this.cellsForZone(x, y, size) });
       this.pushLog("🧪 Une pluie acide tombe...");
     } else if (id === "cemetery") {
       if (this.zombies.length >= ZOMBIE_MAX_ALIVE) return;
       const spot = this.freeSpawn();
-      this.zombies.push({ id: crypto.randomUUID(), x: spot.x, y: spot.y });
+      this.zombies.push({ id: crypto.randomUUID(), x: spot.x, y: spot.y, hp: s.zombieHp });
       this.pushLog("🧟 Une ombre surgit du cimetière...");
     }
   }
@@ -1687,7 +1736,7 @@ class Room {
       }
       const hitP = this.anyPlayerAt(z.x, z.y);
       if (hitP) {
-        this.applyDamage(null, hitP, ZOMBIE_EXPLOSION_DAMAGE);
+        this.applyDamage(null, hitP, (this.modifierSettings.cemetery && this.modifierSettings.cemetery.explosionDamage) || ZOMBIE_EXPLOSION_DAMAGE);
         this.zombies = this.zombies.filter(zz => zz.id !== z.id);
         this.pushLog(`💥 Une ombre explose sur ${hitP.pseudo} !`);
       }
@@ -1990,7 +2039,7 @@ server.on("upgrade", (req, socket, head) => {
     if (!player) { ws.send(JSON.stringify({ type: "error", message: "Partie pleine." })); ws.close(1008, "full"); return; }
 
     ws.send(JSON.stringify({
-      type: "welcome", playerId: player.id, code: room.code, modes: MODES, maps: MAPS, mapModifiers: MAP_MODIFIERS,
+      type: "welcome", playerId: player.id, code: room.code, modes: MODES, maps: MAPS, mapModifiers: MAP_MODIFIERS, modifierTunableRanges: MODIFIER_TUNABLE_RANGES,
       attacks: ATTACKS.filter(a => !a.secret).map(a => ({ id: a.id, name: a.name, weight: a.weight !== undefined ? a.weight : 1, tunables: getAttackTunables(a) })),
     }));
     room.pushLog(`${pseudo} a rejoint la partie.`);
