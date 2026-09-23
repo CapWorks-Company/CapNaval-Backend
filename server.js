@@ -34,11 +34,11 @@ const MAP_MODIFIERS = {
 // Réglages fins par modificateur (bornes de sécurité incluses) : fréquence en
 // occurrences par minute, plus quelques champs propres à chaque modificateur.
 const MODIFIER_TUNABLE_RANGES = {
-  meteorRain:    { perMinute: [1, 12, 4.5], damage: [5, 40, 18] },
-  storm:         { perMinute: [1, 12, 4],   damage: [5, 30, 14] },
-  earthquakeMod: { perMinute: [1, 8, 3],    damage: [2, 20, 6] },
-  acidRainMod:   { perMinute: [0.5, 8, 2.2], damage: [2, 20, 5], size: [1, 5, 2] },
-  cemetery:      { perMinute: [0.5, 8, 3.3], zombieHp: [10, 150, 50], explosionDamage: [5, 60, 22] },
+  meteorRain:    { perMinute: [0.1, 120, 4.5], damage: [0, 300, 18] },
+  storm:         { perMinute: [0.1, 120, 4],   damage: [0, 300, 14] },
+  earthquakeMod: { perMinute: [0.1, 120, 3],   damage: [0, 300, 6] },
+  acidRainMod:   { perMinute: [0.1, 120, 2.2], damage: [0, 300, 5], size: [1, 12, 2] },
+  cemetery:      { perMinute: [0.1, 120, 3.3], zombieHp: [1, 2000, 50], explosionDamage: [0, 300, 22] },
 };
 function defaultModifierSettings() {
   const out = {};
