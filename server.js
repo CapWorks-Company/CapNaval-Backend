@@ -1937,8 +1937,133 @@ class Room {
   }
 }
 
+// ---- Mode Duo : combat de fusées en ligne, 2 joueurs, salle légère à part ----
+const DUO_ARENA_W = 320, DUO_ARENA_H = 320, DUO_ROCKET_MARGIN = 26, DUO_MAX_ENERGY = 12;
+const DUO_WEAPONS = {
+  water: { damage: 3, cost: 1, speed: 5.5 },
+  missile: { damage: 8, cost: 3, speed: 4.5 },
+  laser: { damage: 13, cost: 5, speed: 7 },
+  bomb: { damage: 20, cost: 8, speed: 3.2 },
+  nova: { damage: 32, cost: 12, speed: 3.6 },
+};
+const DUO_IDLE_CLEANUP_MS = 1000 * 60 * 30;
+
+class DuoRoom {
+  constructor(code) {
+    this.code = code;
+    this.players = {};
+    this.order = [];
+    this.status = "waiting"; // waiting -> playing -> ended
+    this.projectiles = [];
+    this.winner = null;
+    this.tickTimer = null;
+    this.lastActivity = Date.now();
+  }
+  addPlayer(ws, pseudo) {
+    if (this.order.length >= 2) return null;
+    const num = this.order.length + 1;
+    const player = { ws, pseudo: (pseudo || `Joueur ${num}`).slice(0, 16), num,
+      x: DUO_ARENA_W / 2, hp: 30, maxHp: 30, energy: 0, moveDir: 0, connected: true };
+    this.players[num] = player;
+    this.order.push(num);
+    this.lastActivity = Date.now();
+    if (this.order.length === 2) this.startMatch();
+    return player;
+  }
+  removePlayer(num) {
+    const p = this.players[num];
+    if (!p) return;
+    p.connected = false;
+    if (this.status === "playing") {
+      this.status = "ended";
+      this.winner = num === 1 ? 2 : 1;
+      if (this.tickTimer) clearInterval(this.tickTimer);
+    }
+    this.broadcast();
+  }
+  startMatch() {
+    this.status = "playing";
+    for (const num of this.order) {
+      const p = this.players[num];
+      p.hp = p.maxHp; p.energy = 0; p.x = DUO_ARENA_W / 2; p.moveDir = 0;
+    }
+    this.projectiles = [];
+    this.winner = null;
+    if (this.tickTimer) clearInterval(this.tickTimer);
+    this.tickTimer = setInterval(() => this.tick(), 50);
+    this.broadcast();
+  }
+  handleMove(num, dir) {
+    const p = this.players[num];
+    if (!p) return;
+    p.moveDir = (dir === -1 || dir === 1) ? dir : 0;
+  }
+  handleFire(num, weaponId) {
+    if (this.status !== "playing") return;
+    const p = this.players[num];
+    const w = DUO_WEAPONS[weaponId];
+    if (!p || !w || p.energy < w.cost) return;
+    p.energy -= w.cost;
+    const y = num === 1 ? DUO_ARENA_H - DUO_ROCKET_MARGIN : DUO_ROCKET_MARGIN;
+    const vy = num === 1 ? -w.speed : w.speed;
+    this.projectiles.push({ x: p.x, y, vy, dmg: w.damage, owner: num, weaponId });
+  }
+  tick() {
+    if (this.status !== "playing") return;
+    this.lastActivity = Date.now();
+    for (const num of this.order) {
+      const p = this.players[num];
+      if (!p) continue;
+      p.energy = Math.min(DUO_MAX_ENERGY, p.energy + 0.05); // +1 par seconde
+      if (p.moveDir) p.x = Math.max(16, Math.min(DUO_ARENA_W - 16, p.x + p.moveDir * 4.4));
+    }
+    for (const proj of this.projectiles.slice()) {
+      proj.y += proj.vy;
+      if (proj.y < -20 || proj.y > DUO_ARENA_H + 20) { this.projectiles = this.projectiles.filter(pp => pp !== proj); continue; }
+      const targetNum = proj.owner === 1 ? 2 : 1;
+      const target = this.players[targetNum];
+      if (!target) continue;
+      const targetY = targetNum === 1 ? DUO_ARENA_H - DUO_ROCKET_MARGIN : DUO_ROCKET_MARGIN;
+      if (Math.abs(proj.y - targetY) < 16 && Math.abs(proj.x - target.x) < 20) {
+        target.hp = Math.max(0, target.hp - proj.dmg);
+        this.projectiles = this.projectiles.filter(pp => pp !== proj);
+        if (target.hp <= 0) {
+          this.status = "ended";
+          this.winner = proj.owner;
+          if (this.tickTimer) clearInterval(this.tickTimer);
+        }
+      }
+    }
+    this.broadcast();
+  }
+  publicState() {
+    return {
+      type: "duoState", status: this.status, winner: this.winner,
+      players: this.order.map(num => {
+        const p = this.players[num];
+        return { num, pseudo: p.pseudo, x: p.x, hp: p.hp, maxHp: p.maxHp, energy: p.energy, connected: p.connected !== false };
+      }),
+      projectiles: this.projectiles.map(pr => ({ x: pr.x, y: pr.y, owner: pr.owner, weaponId: pr.weaponId })),
+    };
+  }
+  broadcast() {
+    const data = JSON.stringify(this.publicState());
+    for (const num of this.order) {
+      const p = this.players[num];
+      if (p && p.ws && p.ws.readyState === 1) p.ws.send(data);
+    }
+  }
+}
+
 // ---- Registre des rooms en mémoire ----
 const rooms = new Map();
+const duoRooms = new Map();
+function getOrCreateDuoRoom(code) {
+  code = code.toUpperCase();
+  let room = duoRooms.get(code);
+  if (!room) { room = new DuoRoom(code); duoRooms.set(code, room); }
+  return room;
+}
 function getOrCreateRoom(code) {
   code = code.toUpperCase();
   let room = rooms.get(code);
@@ -1962,6 +2087,18 @@ const cleanupInterval = setInterval(() => {
 }, 1000 * 60 * 10);
 cleanupInterval.unref();
 
+const duoCleanupInterval = setInterval(() => {
+  const now = Date.now();
+  for (const [code, room] of duoRooms.entries()) {
+    const connectedCount = room.order.filter(n => room.players[n] && room.players[n].connected !== false).length;
+    if (connectedCount === 0 && now - room.lastActivity > DUO_IDLE_CLEANUP_MS) {
+      if (room.tickTimer) clearInterval(room.tickTimer);
+      duoRooms.delete(code);
+    }
+  }
+}, 1000 * 60 * 10);
+duoCleanupInterval.unref();
+
 // ---- Serveur HTTP + WebSocket ----
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -1970,6 +2107,14 @@ const server = http.createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+
+  if (url.pathname === "/api/duo-create" && req.method === "POST") {
+    const code = genCode();
+    getOrCreateDuoRoom(code);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ code }));
+    return;
+  }
 
   if (url.pathname === "/api/create" && req.method === "POST") {
     let body = "";
@@ -2029,6 +2174,26 @@ server.on("upgrade", (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, (ws) => {
     const code = url.searchParams.get("code");
     const pseudo = (url.searchParams.get("pseudo") || "Joueur").slice(0, 16);
+    if (!code) { ws.close(1008, "code manquant"); return; }
+
+    if (url.searchParams.get("duo") === "1") {
+      const duoRoom = getOrCreateDuoRoom(code);
+      const player = duoRoom.addPlayer(ws, pseudo);
+      if (!player) { ws.send(JSON.stringify({ type: "error", message: "Cette partie Duo est déjà pleine." })); ws.close(1008, "full"); return; }
+      ws.send(JSON.stringify({ type: "duoWelcome", num: player.num, code: duoRoom.code }));
+      duoRoom.broadcast();
+      ws.on("message", (raw) => {
+        let msg;
+        try { msg = JSON.parse(raw); } catch (e) { return; }
+        duoRoom.lastActivity = Date.now();
+        if (msg.type === "duoMove") duoRoom.handleMove(player.num, msg.dir);
+        else if (msg.type === "duoFire") duoRoom.handleFire(player.num, msg.weapon);
+        else if (msg.type === "duoRestart" && duoRoom.status === "ended") duoRoom.startMatch();
+      });
+      ws.on("close", () => { duoRoom.removePlayer(player.num); });
+      return;
+    }
+
     const clientId = url.searchParams.get("clientId") || null;
     const color = url.searchParams.get("color") || null;
     const avatarEmoji = url.searchParams.get("avatarEmoji") || null;
@@ -2102,4 +2267,4 @@ if (require.main === module) {
   server.listen(PORT, () => console.log(`CapNaval backend en écoute sur le port ${PORT}`));
 }
 
-module.exports = { Room, MODES, MAPS, ATTACKS, DEFAULT_GRID_SIZE, RECONNECT_GRACE_MS, MAX_PLAYERS_HARD_CAP };
+module.exports = { Room, DuoRoom, MODES, MAPS, ATTACKS, DEFAULT_GRID_SIZE, RECONNECT_GRACE_MS, MAX_PLAYERS_HARD_CAP };
