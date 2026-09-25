@@ -1938,119 +1938,144 @@ class Room {
 }
 
 // ---- Mode Duo : combat de fusées en ligne, 2 joueurs, salle légère à part ----
-const DUO_ARENA_W = 320, DUO_ARENA_H = 320, DUO_ROCKET_MARGIN = 26, DUO_MAX_ENERGY = 12;
-const DUO_WEAPONS = {
-  water: { damage: 3, cost: 1, speed: 5.5 },
-  missile: { damage: 8, cost: 3, speed: 4.5 },
-  laser: { damage: 13, cost: 5, speed: 7 },
-  bomb: { damage: 20, cost: 8, speed: 3.2 },
-  nova: { damage: 32, cost: 12, speed: 3.6 },
-};
+// ---- Mode Duo : Bataille Navale en ligne, tour par tour, chacun sur son appareil ----
+const BS_GRID = 8;
+const BS_SHIPS = [4, 3, 3, 2, 2]; // tailles des navires à placer
 const DUO_IDLE_CLEANUP_MS = 1000 * 60 * 30;
+
+function bsEmptyGrid() { return Array.from({ length: BS_GRID }, () => Array(BS_GRID).fill(null)); }
+// Valide un placement de navires envoyé par le client et construit le plateau serveur correspondant.
+function bsValidatePlacement(shipsInput) {
+  if (!Array.isArray(shipsInput)) return { ok: false, error: "Format de placement invalide." };
+  const required = BS_SHIPS.slice().sort((a, b) => a - b);
+  const given = shipsInput.map(s => s && s.size).sort((a, b) => a - b);
+  if (JSON.stringify(required) !== JSON.stringify(given)) return { ok: false, error: "La liste des navires ne correspond pas." };
+  const board = bsEmptyGrid();
+  const ships = [];
+  let nextId = 1;
+  for (const s of shipsInput) {
+    const r = parseInt(s.r, 10), c = parseInt(s.c, 10), size = parseInt(s.size, 10), dir = s.dir === 1 ? 1 : 0;
+    if (!Number.isInteger(r) || !Number.isInteger(c) || !Number.isInteger(size)) return { ok: false, error: "Navire invalide." };
+    const cells = [];
+    for (let i = 0; i < size; i++) {
+      const rr = dir === 1 ? r + i : r;
+      const cc = dir === 0 ? c + i : c;
+      if (rr < 0 || rr >= BS_GRID || cc < 0 || cc >= BS_GRID) return { ok: false, error: "Un navire dépasse de la grille." };
+      if (board[rr][cc]) return { ok: false, error: "Deux navires se chevauchent." };
+      cells.push([rr, cc]);
+    }
+    const id = nextId++;
+    for (const [rr, cc] of cells) board[rr][cc] = id;
+    ships.push({ id, size, hits: 0, sunk: false });
+  }
+  return { ok: true, board, ships };
+}
 
 class DuoRoom {
   constructor(code) {
     this.code = code;
-    this.players = {};
-    this.order = [];
-    this.status = "waiting"; // waiting -> playing -> ended
-    this.projectiles = [];
+    this.players = new Map(); // num(1|2) -> joueur
+    this.status = "waiting"; // waiting -> placing -> playing -> ended
+    this.turn = 1;
     this.winner = null;
-    this.tickTimer = null;
     this.lastActivity = Date.now();
   }
+  freshPlayerState(ws, pseudo, num) {
+    return {
+      ws, pseudo: (pseudo || `Joueur ${num}`).slice(0, 16), num, connected: true, ready: false,
+      board: bsEmptyGrid(), ships: [], shotsMade: bsEmptyGrid(), shotsReceived: bsEmptyGrid(),
+    };
+  }
   addPlayer(ws, pseudo) {
-    if (this.order.length >= 2) return null;
-    const num = this.order.length + 1;
-    const player = { ws, pseudo: (pseudo || `Joueur ${num}`).slice(0, 16), num,
-      x: DUO_ARENA_W / 2, hp: 30, maxHp: 30, energy: 0, moveDir: 0, connected: true };
-    this.players[num] = player;
-    this.order.push(num);
+    if (this.players.size >= 2) return null;
+    const num = this.players.size + 1;
+    const player = this.freshPlayerState(ws, pseudo, num);
+    this.players.set(num, player);
     this.lastActivity = Date.now();
-    if (this.order.length === 2) this.startMatch();
+    if (this.players.size === 2) this.status = "placing";
+    this.broadcast();
     return player;
   }
   removePlayer(num) {
-    const p = this.players[num];
+    const p = this.players.get(num);
     if (!p) return;
     p.connected = false;
-    if (this.status === "playing") {
+    if (this.status === "playing" || this.status === "placing") {
       this.status = "ended";
       this.winner = num === 1 ? 2 : 1;
-      if (this.tickTimer) clearInterval(this.tickTimer);
     }
     this.broadcast();
   }
-  startMatch() {
-    this.status = "playing";
-    for (const num of this.order) {
-      const p = this.players[num];
-      p.hp = p.maxHp; p.energy = 0; p.x = DUO_ARENA_W / 2; p.moveDir = 0;
-    }
-    this.projectiles = [];
-    this.winner = null;
-    if (this.tickTimer) clearInterval(this.tickTimer);
-    this.tickTimer = setInterval(() => this.tick(), 50);
-    this.broadcast();
-  }
-  handleMove(num, dir) {
-    const p = this.players[num];
-    if (!p) return;
-    p.moveDir = (dir === -1 || dir === 1) ? dir : 0;
-  }
-  handleFire(num, weaponId) {
-    if (this.status !== "playing") return;
-    const p = this.players[num];
-    const w = DUO_WEAPONS[weaponId];
-    if (!p || !w || p.energy < w.cost) return;
-    p.energy -= w.cost;
-    const y = num === 1 ? DUO_ARENA_H - DUO_ROCKET_MARGIN : DUO_ROCKET_MARGIN;
-    const vy = num === 1 ? -w.speed : w.speed;
-    this.projectiles.push({ x: p.x, y, vy, dmg: w.damage, owner: num, weaponId });
-  }
-  tick() {
-    if (this.status !== "playing") return;
+  handlePlace(num, shipsInput) {
+    if (this.status !== "placing") return;
+    const p = this.players.get(num);
+    if (!p || p.ready) return;
+    const result = bsValidatePlacement(shipsInput);
     this.lastActivity = Date.now();
-    for (const num of this.order) {
-      const p = this.players[num];
-      if (!p) continue;
-      p.energy = Math.min(DUO_MAX_ENERGY, p.energy + 0.05); // +1 par seconde
-      if (p.moveDir) p.x = Math.max(16, Math.min(DUO_ARENA_W - 16, p.x + p.moveDir * 4.4));
+    if (!result.ok) {
+      if (p.ws && p.ws.readyState === 1) p.ws.send(JSON.stringify({ type: "duoPlaceError", message: result.error }));
+      return;
     }
-    for (const proj of this.projectiles.slice()) {
-      proj.y += proj.vy;
-      if (proj.y < -20 || proj.y > DUO_ARENA_H + 20) { this.projectiles = this.projectiles.filter(pp => pp !== proj); continue; }
-      const targetNum = proj.owner === 1 ? 2 : 1;
-      const target = this.players[targetNum];
-      if (!target) continue;
-      const targetY = targetNum === 1 ? DUO_ARENA_H - DUO_ROCKET_MARGIN : DUO_ROCKET_MARGIN;
-      if (Math.abs(proj.y - targetY) < 16 && Math.abs(proj.x - target.x) < 20) {
-        target.hp = Math.max(0, target.hp - proj.dmg);
-        this.projectiles = this.projectiles.filter(pp => pp !== proj);
-        if (target.hp <= 0) {
-          this.status = "ended";
-          this.winner = proj.owner;
-          if (this.tickTimer) clearInterval(this.tickTimer);
-        }
-      }
-    }
+    p.board = result.board;
+    p.ships = result.ships;
+    p.ready = true;
+    const other = this.players.get(num === 1 ? 2 : 1);
+    if (other && other.ready) { this.status = "playing"; this.turn = 1; }
     this.broadcast();
   }
-  publicState() {
+  handleFire(num, r, c) {
+    if (this.status !== "playing" || this.turn !== num) return;
+    if (!Number.isInteger(r) || !Number.isInteger(c) || r < 0 || r >= BS_GRID || c < 0 || c >= BS_GRID) return;
+    const opponentNum = num === 1 ? 2 : 1;
+    const me = this.players.get(num), opp = this.players.get(opponentNum);
+    if (!me || !opp || me.shotsMade[r][c]) return;
+    this.lastActivity = Date.now();
+    const shipId = opp.board[r][c];
+    const hit = !!shipId;
+    me.shotsMade[r][c] = hit ? "hit" : "miss";
+    opp.shotsReceived[r][c] = hit ? "hit" : "miss";
+    if (hit) {
+      const ship = opp.ships.find(s => s.id === shipId);
+      ship.hits++;
+      if (ship.hits >= ship.size) ship.sunk = true;
+    }
+    if (opp.ships.every(s => s.sunk)) { this.status = "ended"; this.winner = num; }
+    else { this.turn = opponentNum; }
+    this.broadcast();
+  }
+  restart() {
+    for (const [num, p] of this.players.entries()) {
+      this.players.set(num, this.freshPlayerState(p.ws, p.pseudo, num));
+      this.players.get(num).connected = p.connected;
+    }
+    this.status = this.players.size === 2 ? "placing" : "waiting";
+    this.turn = 1;
+    this.winner = null;
+    this.lastActivity = Date.now();
+    this.broadcast();
+  }
+  publicStateFor(viewerNum) {
+    const opponentNum = viewerNum === 1 ? 2 : 1;
+    const me = this.players.get(viewerNum);
+    const opp = this.players.get(opponentNum);
     return {
-      type: "duoState", status: this.status, winner: this.winner,
-      players: this.order.map(num => {
-        const p = this.players[num];
-        return { num, pseudo: p.pseudo, x: p.x, hp: p.hp, maxHp: p.maxHp, energy: p.energy, connected: p.connected !== false };
-      }),
-      projectiles: this.projectiles.map(pr => ({ x: pr.x, y: pr.y, owner: pr.owner, weaponId: pr.weaponId })),
+      type: "duoState", status: this.status, turn: this.turn, myNum: viewerNum, winner: this.winner,
+      gridSize: BS_GRID, shipSizes: BS_SHIPS,
+      me: me ? {
+        pseudo: me.pseudo, connected: me.connected, ready: me.ready,
+        board: me.board, shotsReceived: me.shotsReceived,
+        shipsSunk: me.ships.filter(s => s.sunk).length, totalShips: BS_SHIPS.length,
+      } : null,
+      opponent: opp ? {
+        pseudo: opp.pseudo, connected: opp.connected, ready: opp.ready,
+        shipsSunk: opp.ships.filter(s => s.sunk).length, totalShips: BS_SHIPS.length,
+      } : null,
+      myShots: me ? me.shotsMade : null,
     };
   }
   broadcast() {
-    const data = JSON.stringify(this.publicState());
-    for (const num of this.order) {
-      const p = this.players[num];
-      if (p && p.ws && p.ws.readyState === 1) p.ws.send(data);
+    for (const [num, p] of this.players.entries()) {
+      if (p.ws && p.ws.readyState === 1) p.ws.send(JSON.stringify(this.publicStateFor(num)));
     }
   }
 }
@@ -2090,9 +2115,8 @@ cleanupInterval.unref();
 const duoCleanupInterval = setInterval(() => {
   const now = Date.now();
   for (const [code, room] of duoRooms.entries()) {
-    const connectedCount = room.order.filter(n => room.players[n] && room.players[n].connected !== false).length;
+    const connectedCount = Array.from(room.players.values()).filter(p => p.connected !== false).length;
     if (connectedCount === 0 && now - room.lastActivity > DUO_IDLE_CLEANUP_MS) {
-      if (room.tickTimer) clearInterval(room.tickTimer);
       duoRooms.delete(code);
     }
   }
@@ -2186,9 +2210,9 @@ server.on("upgrade", (req, socket, head) => {
         let msg;
         try { msg = JSON.parse(raw); } catch (e) { return; }
         duoRoom.lastActivity = Date.now();
-        if (msg.type === "duoMove") duoRoom.handleMove(player.num, msg.dir);
-        else if (msg.type === "duoFire") duoRoom.handleFire(player.num, msg.weapon);
-        else if (msg.type === "duoRestart" && duoRoom.status === "ended") duoRoom.startMatch();
+        if (msg.type === "duoPlace") duoRoom.handlePlace(player.num, msg.ships);
+        else if (msg.type === "duoFire") duoRoom.handleFire(player.num, msg.r, msg.c);
+        else if (msg.type === "duoRestart" && duoRoom.status === "ended") duoRoom.restart();
       });
       ws.on("close", () => { duoRoom.removePlayer(player.num); });
       return;
