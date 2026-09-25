@@ -62,6 +62,10 @@ const DEFAULT_TELEGRAPH_MS = 1300;
 const NUKE_RESOLVE_DELAY_MS = 2000; // dégâts appliqués juste au moment de la vraie explosion (après le faux départ), côté client
 const DEFAULT_POWERUP_INTERVAL_SEC = 14;
 const POWERUP_TYPES = ["heal", "resist", "speed"];
+const TREASURE_SPAWN_INTERVAL_SEC = 4;
+const TREASURE_MAX_ON_MAP = 6;
+const HILL_MOVE_INTERVAL_SEC = 14; // mode Zone mobile : rythme de déplacement de la zone à tenir
+const INFECTION_TAG_RADIUS = 1; // distance (Chebyshev) à laquelle un joueur infecté contamine les autres
 const ROOM_IDLE_CLEANUP_MS = 1000 * 60 * 60 * 3;
 const MAX_PLAYERS_HARD_CAP = 6;
 const BOT_DIFFICULTIES = ["easy", "medium", "hard"];
@@ -141,6 +145,10 @@ const MODES = {
   chrono:   { label: "Chrono",            desc: "Partie limitée dans le temps. Le plus d'éliminations à la fin gagne, mort subite en cas d'égalité.", respawns: true },
   boss:     { label: "Chasse au Boss",    desc: "Un joueur (ou un bot) devient le Boss, bien plus costaud. Les autres doivent l'abattre avant qu'il ne les élimine tous. Pas de respawn.", respawns: false },
   ctf:      { label: "Capture du drapeau", desc: "2 équipes, 2 bases. Vole le drapeau adverse et ramène-le sur ta base pour marquer. Premier à X captures gagne.", respawns: true },
+  zoneMobile:   { label: "Zone mobile",      desc: "Comme Roi de la case, mais la zone à tenir se déplace régulièrement sur la carte. Premier à X points gagne.", respawns: true },
+  treasureHunt: { label: "Chasse au trésor", desc: "Des trésors apparaissent au hasard sur la carte. Premier à en ramasser X gagne.", respawns: true },
+  escort:       { label: "Escorte",          desc: "Un joueur VIP tiré au sort doit survivre face aux autres jusqu'à la fin du temps imparti.", respawns: false },
+  infection:    { label: "Infection",        desc: "Un joueur infecté au hasard doit s'approcher des autres pour les contaminer. Les humains encore sains à la fin du temps imparti gagnent, sauf si tout le monde est infecté avant.", respawns: false },
 };
 
 const MAPS = {
@@ -271,6 +279,9 @@ class Room {
       players: Object.values(this.players).map(({ ws, clientId, disconnectedAt, ...rest }) => rest),
       hazards: this.hazards.map(h => h.type === "mine" ? { x: h.x, y: h.y, type: "mine", ownerId: h.ownerId } : h),
       powerups: this.powerups,
+      treasures: this.treasures || [],
+      escortId: this.escortId || null,
+      infectionEndAt: this.infectionEndAt || null,
       obstacles: this.obstacles,
       mapId: this.mapId,
       mapLabel: MAPS[this.mapId] ? MAPS[this.mapId].label : null,
@@ -370,9 +381,14 @@ class Room {
   inBounds(x, y) { return inBoundsGlobal(x, y, this.gridSize); }
 
   // Cases centrales du mode Roi de la case, calculées selon la taille de grille active.
+  // En Zone mobile, une seule case suit plutôt la position mouvante this.movingHillPos.
   hillCells() {
     const s = this.gridSize;
     const mid = Math.floor((s - 1) / 2);
+    if (this.mode === "zoneMobile") {
+      const pos = this.movingHillPos || { x: mid, y: mid };
+      return [[pos.x, pos.y]];
+    }
     if (s % 2 === 0) return [[mid, mid], [mid, mid + 1], [mid + 1, mid], [mid + 1, mid + 1]];
     return [[mid, mid]];
   }
@@ -639,6 +655,7 @@ class Room {
     this.winner = null;
     this.hazards = [];
     this.powerups = [];
+    this.treasures = [];
     this.suddenDeath = false;
     this.suddenDeathIds = new Set();
     if (this.timer) clearTimeout(this.timer);
@@ -664,9 +681,12 @@ class Room {
 
     const config = {};
     if (mode === "koHunt") config.targetKO = clamp(parseInt(rawConfig.targetKO) || 5, 1, 50);
-    if (mode === "kingHill") config.targetScore = clamp(parseInt(rawConfig.targetScore) || 20, 1, 200);
+    if (mode === "kingHill" || mode === "zoneMobile") config.targetScore = clamp(parseInt(rawConfig.targetScore) || 20, 1, 200);
     if (mode === "chrono") config.minutes = clamp(parseFloat(rawConfig.minutes) || 5, 1, 60);
     if (mode === "ctf") config.targetCaptures = clamp(parseInt(rawConfig.targetCaptures) || 3, 1, 20);
+    if (mode === "treasureHunt") config.targetTreasures = clamp(parseInt(rawConfig.targetTreasures) || 8, 1, 50);
+    if (mode === "escort") config.escortMinutes = clamp(parseFloat(rawConfig.escortMinutes) || 3, 1, 15);
+    if (mode === "infection") config.infectionMinutes = clamp(parseFloat(rawConfig.infectionMinutes) || 4, 1, 30);
 
     this.mode = mode;
     this.config = config;
@@ -675,6 +695,8 @@ class Room {
     this.hazards = [];
     this.powerups = [];
     this.lastPowerupSpawn = Date.now();
+    this.treasures = [];
+    this.lastTreasureSpawn = Date.now();
     this.powerupsEnabled = rawConfig.powerupsEnabled !== false && rawConfig.powerupsEnabled !== "false";
     this.powerupIntervalSec = clamp(parseInt(rawConfig.powerupIntervalSec) || DEFAULT_POWERUP_INTERVAL_SEC, 5, 120);
     this.teamsEnabled = rawConfig.teamsEnabled === true || rawConfig.teamsEnabled === "true";
@@ -735,7 +757,13 @@ class Room {
     this.pendingAttacks.clear();
     this.activeTelegraphs = [];
 
-    const hillExclude = mode === "kingHill" ? this.hillCells().map(([x, y]) => ({ x, y })) : [];
+    this.movingHillPos = null;
+    if (mode === "zoneMobile") {
+      const mid = Math.floor((this.gridSize - 1) / 2);
+      this.movingHillPos = { x: mid, y: mid };
+      this.lastHillMoveAt = Date.now();
+    }
+    const hillExclude = (mode === "kingHill" || mode === "zoneMobile") ? this.hillCells().map(([x, y]) => ({ x, y })) : [];
     if (rawConfig.mapId === "custom" && rawConfig.customMap) this.useCustomMap(rawConfig.customMap, hillExclude);
     else this.generateMap(rawConfig.mapId, hillExclude);
 
@@ -768,6 +796,18 @@ class Room {
       ];
     }
 
+    this.escortId = null;
+    if (mode === "escort") {
+      this.teamsEnabled = false; // le VIP à protéger n'a pas de sens avec des équipes
+      const ids = Object.keys(this.players);
+      this.escortId = ids[randInt(ids.length)];
+    }
+
+    this.infectionEndAt = null;
+    if (mode === "infection") {
+      this.teamsEnabled = false; // infectés vs humains, pas d'équipes séparées en plus
+    }
+
     const playerList = Object.values(this.players);
     playerList.forEach((p, idx) => {
       const isBoss = mode === "boss" && p.id === this.bossId;
@@ -776,11 +816,19 @@ class Room {
       p.hp = isBoss ? Math.round(this.startingHP * this.bossHpMultiplier) : this.startingHP;
       p.alive = true; p.x = spawn.x; p.y = spawn.y;
       p.shield = false; p.respawnAt = null; p.resistUntil = null; p.speedUntil = null;
+      p.infected = false;
       p.rootedUntil = null; p.slowedUntil = null;
       p.invulnUntil = this.spawnProtectionSec > 0 ? Date.now() + this.spawnProtectionSec * 1000 : null;
       p.eliminations = 0; p.score = 0; p.damageDealt = 0; p.damageTaken = 0; p.timesKO = 0; p.biggestHit = 0; p.firstKillAt = null; p.lastTeleportAt = null; p.hidden = false;
       p.team = this.teamsEnabled ? (idx % 2 === 0 ? "A" : "B") : null;
     });
+
+    if (mode === "infection") {
+      const ids = Object.keys(this.players);
+      const patientZero = ids[randInt(ids.length)];
+      this.players[patientZero].infected = true;
+      this.infectionEndAt = Date.now() + config.infectionMinutes * 60000;
+    }
 
     this.status = "playing";
     this.matchStartedAt = Date.now();
@@ -808,7 +856,7 @@ class Room {
     this.broadcastState();
 
     if (this.hillTimer) clearInterval(this.hillTimer);
-    if (mode === "kingHill") {
+    if (mode === "kingHill" || mode === "zoneMobile") {
       this.hillTimer = setInterval(() => this.hillTick(), HILL_TICK_MS);
       this.hillTimer.unref();
     }
@@ -817,7 +865,9 @@ class Room {
     this.secondTimer = setInterval(() => this.secondTick(), 1000);
     this.secondTimer.unref();
 
-    this.scheduleTick(this.turnGapSec * 1000);
+    // Le mode Infection n'a pas d'armes ni de tours : c'est une pure chasse au
+    // déplacement, on ne lance donc jamais le cycle de tirage d'attaques.
+    if (mode !== "infection") this.scheduleTick(this.turnGapSec * 1000);
   }
 
   scheduleTick(delayMs) {
@@ -855,9 +905,21 @@ class Room {
     } else if (this.mode === "koHunt") {
       const winner = list.find(p => p.eliminations >= this.config.targetKO);
       if (winner) { this.endGame([winner.id], "koHunt"); return; }
-    } else if (this.mode === "kingHill") {
+    } else if (this.mode === "kingHill" || this.mode === "zoneMobile") {
       const winner = list.find(p => p.score >= this.config.targetScore);
-      if (winner) { this.endGame([winner.id], "kingHill"); return; }
+      if (winner) { this.endGame([winner.id], this.mode); return; }
+    } else if (this.mode === "treasureHunt") {
+      const winner = list.find(p => p.score >= this.config.targetTreasures);
+      if (winner) { this.endGame([winner.id], "treasureHunt"); return; }
+    } else if (this.mode === "escort") {
+      const vip = this.players[this.escortId];
+      if (!vip || !vip.alive) {
+        const winners = list.filter(p => p.id !== this.escortId).map(p => p.id);
+        this.endGame(winners, "escort");
+        return;
+      }
+    } else if (this.mode === "infection") {
+      if (list.length > 1 && list.every(p => p.infected)) { this.endGame(list.map(p => p.id), "infection"); return; }
     } else if (this.mode === "boss") {
       const boss = this.players[this.bossId];
       if (!boss || !boss.alive) {
@@ -884,10 +946,15 @@ class Room {
         const sum = list.filter(p => p.team === t).reduce((s, p) => s + p.eliminations, 0);
         if (sum >= this.config.targetKO) { this.endGame(list.filter(p => p.team === t).map(p => p.id), "koHunt"); return; }
       }
-    } else if (this.mode === "kingHill") {
+    } else if (this.mode === "kingHill" || this.mode === "zoneMobile") {
       for (const t of teamsPresent) {
         const sum = list.filter(p => p.team === t).reduce((s, p) => s + p.score, 0);
-        if (sum >= this.config.targetScore) { this.endGame(list.filter(p => p.team === t).map(p => p.id), "kingHill"); return; }
+        if (sum >= this.config.targetScore) { this.endGame(list.filter(p => p.team === t).map(p => p.id), this.mode); return; }
+      }
+    } else if (this.mode === "treasureHunt") {
+      for (const t of teamsPresent) {
+        const sum = list.filter(p => p.team === t).reduce((s, p) => s + p.score, 0);
+        if (sum >= this.config.targetTreasures) { this.endGame(list.filter(p => p.team === t).map(p => p.id), "treasureHunt"); return; }
       }
     } else if (this.mode === "ctf") {
       for (const t of teamsPresent) {
@@ -1013,6 +1080,34 @@ class Room {
     const pu = this.powerups[idx];
     this.powerups.splice(idx, 1);
     this.applyPowerup(player, pu.type);
+  }
+
+  // ---- Chasse au trésor ----
+  checkTreasurePickup(player, x, y) {
+    if (this.mode !== "treasureHunt") return;
+    const idx = this.treasures.findIndex(t => t.x === x && t.y === y);
+    if (idx < 0) return;
+    this.treasures.splice(idx, 1);
+    player.score += 1;
+    this.pushLog(`${player.pseudo} ramasse un trésor ! (${player.score}/${this.config.targetTreasures})`);
+    this.checkWinCondition();
+  }
+
+  // ---- Infection : contamine tout joueur sain à portée d'un joueur infecté ----
+  checkInfectionTag(mover) {
+    if (this.mode !== "infection" || !mover.alive) return;
+    const nearby = Object.values(this.players).filter(p => p.id !== mover.id && p.alive &&
+      Math.abs(p.x - mover.x) <= INFECTION_TAG_RADIUS && Math.abs(p.y - mover.y) <= INFECTION_TAG_RADIUS);
+    let changed = false;
+    if (mover.infected) {
+      for (const p of nearby) {
+        if (!p.infected) { p.infected = true; this.pushLog(`🧟 ${p.pseudo} a été infecté par ${mover.pseudo} !`); changed = true; }
+      }
+    } else {
+      const infector = nearby.find(p => p.infected);
+      if (infector) { mover.infected = true; this.pushLog(`🧟 ${mover.pseudo} a été infecté par ${infector.pseudo} !`); changed = true; }
+    }
+    if (changed) this.checkWinCondition();
   }
 
   // ---- Capture du drapeau ----
@@ -1144,6 +1239,8 @@ class Room {
     player.x = x; player.y = y; player.lastMove = now;
     this.checkMineTrigger(player, x, y);
     this.checkPowerupPickup(player, x, y);
+    this.checkTreasurePickup(player, x, y);
+    this.checkInfectionTag(player);
     this.checkFlagInteractions(player, x, y);
     this.checkTeleportTile(player, player.x, player.y);
     player.hidden = this.isBush(player.x, player.y);
@@ -1534,8 +1631,15 @@ class Room {
   }
 
   hillTick() {
-    if (this.status !== "playing" || this.mode !== "kingHill") { clearInterval(this.hillTimer); return; }
+    if (this.status !== "playing" || (this.mode !== "kingHill" && this.mode !== "zoneMobile")) { clearInterval(this.hillTimer); return; }
     let changed = false;
+    if (this.mode === "zoneMobile" && Date.now() - this.lastHillMoveAt >= HILL_MOVE_INTERVAL_SEC * 1000) {
+      const spot = this.freeSpawn();
+      this.movingHillPos = { x: spot.x, y: spot.y };
+      this.lastHillMoveAt = Date.now();
+      this.pushLog("🎯 La zone à tenir se déplace !");
+      changed = true;
+    }
     for (const p of Object.values(this.players)) {
       if (p.alive && this.onHill(p.x, p.y)) { p.score += 1; changed = true; }
     }
@@ -1746,6 +1850,12 @@ class Room {
   secondTick() {
     if (this.status !== "playing") return;
 
+    if (this.mode === "infection" && this.infectionEndAt && Date.now() >= this.infectionEndAt) {
+      const humans = Object.values(this.players).filter(p => !p.infected).map(p => p.id);
+      this.endGame(humans, "infection");
+      return;
+    }
+
     this.purgeStaleDisconnected();
     this.maybeBotAct();
 
@@ -1811,6 +1921,15 @@ class Room {
         const type = POWERUP_TYPES[randInt(POWERUP_TYPES.length)];
         this.powerups.push({ id: crypto.randomUUID(), x: spot.x, y: spot.y, type });
         this.lastPowerupSpawn = Date.now();
+      }
+    }
+
+    if (this.mode === "treasureHunt") {
+      const intervalMs = TREASURE_SPAWN_INTERVAL_SEC * 1000;
+      if (Date.now() - this.lastTreasureSpawn >= intervalMs && this.treasures.length < TREASURE_MAX_ON_MAP) {
+        const spot = this.freeSpawn();
+        this.treasures.push({ id: crypto.randomUUID(), x: spot.x, y: spot.y });
+        this.lastTreasureSpawn = Date.now();
       }
     }
 
@@ -1974,6 +2093,7 @@ function bsValidatePlacement(shipsInput) {
 class DuoRoom {
   constructor(code) {
     this.code = code;
+    this.game = "battleship";
     this.players = new Map(); // num(1|2) -> joueur
     this.status = "waiting"; // waiting -> placing -> playing -> ended
     this.turn = 1;
@@ -2080,13 +2200,297 @@ class DuoRoom {
   }
 }
 
+// ================= MODE DUO : PUISSANCE 4 EN LIGNE =================
+const C4_ROWS = 6, C4_COLS = 7;
+function c4EmptyBoard() { return Array.from({ length: C4_ROWS }, () => Array(C4_COLS).fill(null)); }
+function c4CheckWin(board, r, c, num) {
+  const dirs = [[0, 1], [1, 0], [1, 1], [1, -1]];
+  for (const [dr, dc] of dirs) {
+    let count = 1;
+    for (let s = 1; s < 4; s++) { const rr = r + dr * s, cc = c + dc * s; if (rr < 0 || rr >= C4_ROWS || cc < 0 || cc >= C4_COLS || board[rr][cc] !== num) break; count++; }
+    for (let s = 1; s < 4; s++) { const rr = r - dr * s, cc = c - dc * s; if (rr < 0 || rr >= C4_ROWS || cc < 0 || cc >= C4_COLS || board[rr][cc] !== num) break; count++; }
+    if (count >= 4) return true;
+  }
+  return false;
+}
+class Connect4Room {
+  constructor(code) {
+    this.code = code;
+    this.game = "connect4";
+    this.players = new Map();
+    this.status = "waiting"; // waiting -> playing -> ended
+    this.board = c4EmptyBoard();
+    this.turn = 1;
+    this.winner = null;
+    this.lastActivity = Date.now();
+  }
+  addPlayer(ws, pseudo) {
+    if (this.players.size >= 2) return null;
+    const num = this.players.size + 1;
+    const player = { ws, pseudo: (pseudo || `Joueur ${num}`).slice(0, 16), num, connected: true };
+    this.players.set(num, player);
+    this.lastActivity = Date.now();
+    if (this.players.size === 2) this.status = "playing";
+    this.broadcast();
+    return player;
+  }
+  removePlayer(num) {
+    const p = this.players.get(num);
+    if (!p) return;
+    p.connected = false;
+    if (this.status === "playing") { this.status = "ended"; this.winner = num === 1 ? 2 : 1; }
+    this.broadcast();
+  }
+  handleDrop(num, col) {
+    if (this.status !== "playing" || this.turn !== num) return;
+    if (!Number.isInteger(col) || col < 0 || col >= C4_COLS) return;
+    let row = -1;
+    for (let r = C4_ROWS - 1; r >= 0; r--) if (!this.board[r][col]) { row = r; break; }
+    if (row < 0) return; // colonne pleine
+    this.board[row][col] = num;
+    this.lastActivity = Date.now();
+    if (c4CheckWin(this.board, row, col, num)) { this.status = "ended"; this.winner = num; }
+    else if (this.board.every(r => r.every(c => c))) { this.status = "ended"; this.winner = null; } // match nul
+    else this.turn = num === 1 ? 2 : 1;
+    this.broadcast();
+  }
+  restart() {
+    this.board = c4EmptyBoard();
+    this.turn = 1;
+    this.winner = null;
+    this.status = this.players.size === 2 ? "playing" : "waiting";
+    this.lastActivity = Date.now();
+    this.broadcast();
+  }
+  publicStateFor(viewerNum) {
+    const opp = this.players.get(viewerNum === 1 ? 2 : 1);
+    const me = this.players.get(viewerNum);
+    return {
+      type: "duoState", game: "connect4", status: this.status, turn: this.turn, myNum: viewerNum, winner: this.winner,
+      board: this.board,
+      me: me ? { pseudo: me.pseudo, connected: me.connected } : null,
+      opponent: opp ? { pseudo: opp.pseudo, connected: opp.connected } : null,
+    };
+  }
+  broadcast() {
+    for (const [num, p] of this.players.entries()) {
+      if (p.ws && p.ws.readyState === 1) p.ws.send(JSON.stringify(this.publicStateFor(num)));
+    }
+  }
+}
+
+// ================= MODE DUO : PIERRE-FEUILLE-CISEAUX EN LIGNE =================
+const RPS_WIN_TARGET = 3; // meilleur des 5 : premier à 3 manches gagnées
+function rpsBeats(a, b) { return (a === "rock" && b === "scissors") || (a === "scissors" && b === "paper") || (a === "paper" && b === "rock"); }
+class RpsRoom {
+  constructor(code) {
+    this.code = code;
+    this.game = "rps";
+    this.players = new Map();
+    this.status = "waiting"; // waiting -> playing -> ended
+    this.scores = { 1: 0, 2: 0 };
+    this.choices = {}; // num -> choix pour la manche en cours
+    this.round = 1;
+    this.lastResult = null;
+    this.winner = null;
+    this.lastActivity = Date.now();
+  }
+  addPlayer(ws, pseudo) {
+    if (this.players.size >= 2) return null;
+    const num = this.players.size + 1;
+    const player = { ws, pseudo: (pseudo || `Joueur ${num}`).slice(0, 16), num, connected: true };
+    this.players.set(num, player);
+    this.lastActivity = Date.now();
+    if (this.players.size === 2) this.status = "playing";
+    this.broadcast();
+    return player;
+  }
+  removePlayer(num) {
+    const p = this.players.get(num);
+    if (!p) return;
+    p.connected = false;
+    if (this.status === "playing") { this.status = "ended"; this.winner = num === 1 ? 2 : 1; }
+    this.broadcast();
+  }
+  handleChoice(num, choice) {
+    if (this.status !== "playing" || !["rock", "paper", "scissors"].includes(choice)) return;
+    if (this.choices[num]) return; // déjà choisi cette manche
+    this.choices[num] = choice;
+    this.lastActivity = Date.now();
+    if (this.choices[1] && this.choices[2]) this.resolveRound();
+    else this.broadcast();
+  }
+  resolveRound() {
+    const c1 = this.choices[1], c2 = this.choices[2];
+    let roundWinner = null;
+    if (c1 !== c2) roundWinner = rpsBeats(c1, c2) ? 1 : 2;
+    if (roundWinner) this.scores[roundWinner]++;
+    this.lastResult = { choices: { ...this.choices }, roundWinner };
+    this.choices = {};
+    if (this.scores[1] >= RPS_WIN_TARGET || this.scores[2] >= RPS_WIN_TARGET) {
+      this.status = "ended";
+      this.winner = this.scores[1] > this.scores[2] ? 1 : 2;
+    } else {
+      this.round++;
+    }
+    this.broadcast();
+  }
+  restart() {
+    this.scores = { 1: 0, 2: 0 };
+    this.choices = {};
+    this.round = 1;
+    this.lastResult = null;
+    this.winner = null;
+    this.status = this.players.size === 2 ? "playing" : "waiting";
+    this.lastActivity = Date.now();
+    this.broadcast();
+  }
+  publicStateFor(viewerNum) {
+    const opp = this.players.get(viewerNum === 1 ? 2 : 1);
+    const me = this.players.get(viewerNum);
+    return {
+      type: "duoState", game: "rps", status: this.status, winner: this.winner, myNum: viewerNum,
+      round: this.round, scores: this.scores, winTarget: RPS_WIN_TARGET,
+      myChoice: this.choices[viewerNum] || null,
+      opponentChose: !!this.choices[viewerNum === 1 ? 2 : 1],
+      lastResult: this.lastResult,
+      me: me ? { pseudo: me.pseudo, connected: me.connected } : null,
+      opponent: opp ? { pseudo: opp.pseudo, connected: opp.connected } : null,
+    };
+  }
+  broadcast() {
+    for (const [num, p] of this.players.entries()) {
+      if (p.ws && p.ws.readyState === 1) p.ws.send(JSON.stringify(this.publicStateFor(num)));
+    }
+  }
+}
+
+// ================= MODE DUO : DAMES (simplifiées) EN LIGNE =================
+const CK_SIZE = 8;
+function ckInitialBoard() {
+  const board = Array.from({ length: CK_SIZE }, () => Array(CK_SIZE).fill(null));
+  for (let r = 0; r < 3; r++) for (let c = 0; c < CK_SIZE; c++) if ((r + c) % 2 === 1) board[r][c] = { owner: 1, king: false };
+  for (let r = CK_SIZE - 3; r < CK_SIZE; r++) for (let c = 0; c < CK_SIZE; c++) if ((r + c) % 2 === 1) board[r][c] = { owner: 2, king: false };
+  return board;
+}
+function ckInBounds(r, c) { return r >= 0 && r < CK_SIZE && c >= 0 && c < CK_SIZE; }
+function ckDirsFor(piece) {
+  if (piece.king) return [[-1, -1], [-1, 1], [1, -1], [1, 1]];
+  return piece.owner === 1 ? [[1, -1], [1, 1]] : [[-1, -1], [-1, 1]];
+}
+// Renvoie null si le coup n'est pas légal, sinon {capture:null} (coup simple) ou {capture:{r,c}} (une prise).
+// Simplification volontaire : pas de prise obligatoire, pas de rafle en chaîne (un coup = un déplacement ou une prise).
+function ckValidMove(board, num, fr, fc, tr, tc) {
+  const piece = board[fr] && board[fr][fc];
+  if (!piece || piece.owner !== num) return null;
+  if (!ckInBounds(tr, tc) || board[tr][tc]) return null;
+  const dirs = ckDirsFor(piece);
+  const dr = tr - fr, dc = tc - fc;
+  for (const [ddr, ddc] of dirs) {
+    if (dr === ddr && dc === ddc) return { capture: null };
+    if (dr === ddr * 2 && dc === ddc * 2) {
+      const mr = fr + ddr, mc = fc + ddc;
+      const mid = board[mr] && board[mr][mc];
+      if (mid && mid.owner !== num) return { capture: { r: mr, c: mc } };
+    }
+  }
+  return null;
+}
+class CheckersRoom {
+  constructor(code) {
+    this.code = code;
+    this.game = "checkers";
+    this.players = new Map();
+    this.status = "waiting"; // waiting -> playing -> ended
+    this.board = ckInitialBoard();
+    this.turn = 1;
+    this.winner = null;
+    this.lastActivity = Date.now();
+  }
+  addPlayer(ws, pseudo) {
+    if (this.players.size >= 2) return null;
+    const num = this.players.size + 1;
+    const player = { ws, pseudo: (pseudo || `Joueur ${num}`).slice(0, 16), num, connected: true };
+    this.players.set(num, player);
+    this.lastActivity = Date.now();
+    if (this.players.size === 2) this.status = "playing";
+    this.broadcast();
+    return player;
+  }
+  removePlayer(num) {
+    const p = this.players.get(num);
+    if (!p) return;
+    p.connected = false;
+    if (this.status === "playing") { this.status = "ended"; this.winner = num === 1 ? 2 : 1; }
+    this.broadcast();
+  }
+  handleMove(num, fr, fc, tr, tc) {
+    if (this.status !== "playing" || this.turn !== num) return;
+    if (![fr, fc, tr, tc].every(Number.isInteger)) return;
+    const result = ckValidMove(this.board, num, fr, fc, tr, tc);
+    if (!result) return;
+    const piece = this.board[fr][fc];
+    this.board[tr][tc] = piece;
+    this.board[fr][fc] = null;
+    if (result.capture) this.board[result.capture.r][result.capture.c] = null;
+    if ((piece.owner === 1 && tr === CK_SIZE - 1) || (piece.owner === 2 && tr === 0)) piece.king = true;
+    this.lastActivity = Date.now();
+    const oppNum = num === 1 ? 2 : 1;
+    const oppHasPieces = this.board.some(row => row.some(cell => cell && cell.owner === oppNum));
+    if (!oppHasPieces || !this.hasAnyLegalMove(oppNum)) { this.status = "ended"; this.winner = num; this.broadcast(); return; }
+    this.turn = oppNum;
+    this.broadcast();
+  }
+  hasAnyLegalMove(num) {
+    for (let r = 0; r < CK_SIZE; r++) for (let c = 0; c < CK_SIZE; c++) {
+      const piece = this.board[r][c];
+      if (!piece || piece.owner !== num) continue;
+      for (let tr = 0; tr < CK_SIZE; tr++) for (let tc = 0; tc < CK_SIZE; tc++) {
+        if (ckValidMove(this.board, num, r, c, tr, tc)) return true;
+      }
+    }
+    return false;
+  }
+  restart() {
+    this.board = ckInitialBoard();
+    this.turn = 1;
+    this.winner = null;
+    this.status = this.players.size === 2 ? "playing" : "waiting";
+    this.lastActivity = Date.now();
+    this.broadcast();
+  }
+  publicStateFor(viewerNum) {
+    const opp = this.players.get(viewerNum === 1 ? 2 : 1);
+    const me = this.players.get(viewerNum);
+    return {
+      type: "duoState", game: "checkers", status: this.status, turn: this.turn, myNum: viewerNum, winner: this.winner,
+      board: this.board,
+      me: me ? { pseudo: me.pseudo, connected: me.connected } : null,
+      opponent: opp ? { pseudo: opp.pseudo, connected: opp.connected } : null,
+    };
+  }
+  broadcast() {
+    for (const [num, p] of this.players.entries()) {
+      if (p.ws && p.ws.readyState === 1) p.ws.send(JSON.stringify(this.publicStateFor(num)));
+    }
+  }
+}
+
 // ---- Registre des rooms en mémoire ----
 const rooms = new Map();
 const duoRooms = new Map();
-function getOrCreateDuoRoom(code) {
+const DUO_GAMES = ["battleship", "connect4", "rps", "checkers"];
+function getOrCreateDuoRoom(code, game) {
   code = code.toUpperCase();
   let room = duoRooms.get(code);
-  if (!room) { room = new DuoRoom(code); duoRooms.set(code, room); }
+  if (!room) {
+    const g = DUO_GAMES.includes(game) ? game : "battleship";
+    if (g === "connect4") room = new Connect4Room(code);
+    else if (g === "rps") room = new RpsRoom(code);
+    else if (g === "checkers") room = new CheckersRoom(code);
+    else room = new DuoRoom(code);
+    duoRooms.set(code, room);
+  }
   return room;
 }
 function getOrCreateRoom(code) {
@@ -2133,10 +2537,16 @@ const server = http.createServer((req, res) => {
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
   if (url.pathname === "/api/duo-create" && req.method === "POST") {
-    const code = genCode();
-    getOrCreateDuoRoom(code);
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ code }));
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; if (body.length > 2000) req.destroy(); });
+    req.on("end", () => {
+      let parsed = {};
+      try { parsed = JSON.parse(body || "{}"); } catch (e) { /* ignore */ }
+      const code = genCode();
+      getOrCreateDuoRoom(code, parsed.game);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ code }));
+    });
     return;
   }
 
@@ -2201,18 +2611,27 @@ server.on("upgrade", (req, socket, head) => {
     if (!code) { ws.close(1008, "code manquant"); return; }
 
     if (url.searchParams.get("duo") === "1") {
-      const duoRoom = getOrCreateDuoRoom(code);
+      const game = url.searchParams.get("game");
+      const duoRoom = getOrCreateDuoRoom(code, game);
       const player = duoRoom.addPlayer(ws, pseudo);
       if (!player) { ws.send(JSON.stringify({ type: "error", message: "Cette partie Duo est déjà pleine." })); ws.close(1008, "full"); return; }
-      ws.send(JSON.stringify({ type: "duoWelcome", num: player.num, code: duoRoom.code }));
+      ws.send(JSON.stringify({ type: "duoWelcome", num: player.num, code: duoRoom.code, game: duoRoom.game }));
       duoRoom.broadcast();
       ws.on("message", (raw) => {
         let msg;
         try { msg = JSON.parse(raw); } catch (e) { return; }
         duoRoom.lastActivity = Date.now();
-        if (msg.type === "duoPlace") duoRoom.handlePlace(player.num, msg.ships);
-        else if (msg.type === "duoFire") duoRoom.handleFire(player.num, msg.r, msg.c);
-        else if (msg.type === "duoRestart" && duoRoom.status === "ended") duoRoom.restart();
+        if (msg.type === "duoRestart" && duoRoom.status === "ended") { duoRoom.restart(); return; }
+        if (duoRoom.game === "battleship") {
+          if (msg.type === "duoPlace") duoRoom.handlePlace(player.num, msg.ships);
+          else if (msg.type === "duoFire") duoRoom.handleFire(player.num, msg.r, msg.c);
+        } else if (duoRoom.game === "connect4") {
+          if (msg.type === "duoDrop") duoRoom.handleDrop(player.num, msg.col);
+        } else if (duoRoom.game === "rps") {
+          if (msg.type === "duoChoice") duoRoom.handleChoice(player.num, msg.choice);
+        } else if (duoRoom.game === "checkers") {
+          if (msg.type === "duoMove") duoRoom.handleMove(player.num, msg.fr, msg.fc, msg.tr, msg.tc);
+        }
       });
       ws.on("close", () => { duoRoom.removePlayer(player.num); });
       return;
@@ -2291,4 +2710,4 @@ if (require.main === module) {
   server.listen(PORT, () => console.log(`CapNaval backend en écoute sur le port ${PORT}`));
 }
 
-module.exports = { Room, DuoRoom, MODES, MAPS, ATTACKS, DEFAULT_GRID_SIZE, RECONNECT_GRACE_MS, MAX_PLAYERS_HARD_CAP };
+module.exports = { Room, DuoRoom, Connect4Room, RpsRoom, CheckersRoom, MODES, MAPS, ATTACKS, DEFAULT_GRID_SIZE, RECONNECT_GRACE_MS, MAX_PLAYERS_HARD_CAP };
